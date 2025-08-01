@@ -1,0 +1,38 @@
+{
+  "name": "cold-storage-backend",
+  "version": "1.0.0",
+  "description": "fastify backend for cold storage app ",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "server": "nodemon server.js"
+  },
+  "author": "Dhairya Sehgal",
+  "license": "ISC",
+  "dependencies": {
+    "@fastify/accepts-serializer": "^6.0.2",
+    "@fastify/cookie": "^11.0.2",
+    "@fastify/cors": "^11.0.1",
+    "@fastify/formbody": "^8.0.2",
+    "@fastify/multipart": "^9.0.3",
+    "@fastify/swagger": "^9.5.1",
+    "@fastify/swagger-ui": "^5.2.3",
+    "@fastify/view": "^11.1.0",
+    "bcryptjs": "^2.4.3",
+    "cloudinary": "^2.0.3",
+    "date-fns": "^4.1.0",
+    "dotenv": "^16.4.5",
+    "ejs": "^3.1.9",
+    "fastify": "^5.4.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.2.3",
+    "pino-pretty": "^11.2.2",
+    "twilio": "^5.0.1",
+    "zod": "^3.22.4"
+  },
+  "packageManager": "pnpm@10.3.0+sha512.ee592eda8815a8a293c206bb0917c4bb0ff274c50def7cbc17be05ec641fc2d1b02490ce660061356bd0d126a4d7eb2ec8830e6959fb8a447571c631d5a2442d",
+  "devDependencies": {
+    "nodemon": "^3.1.9"
+  }
+}
