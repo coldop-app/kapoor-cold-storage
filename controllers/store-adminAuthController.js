@@ -9,6 +9,8 @@ import {
   farmerIdSchema,
 } from "../utils/validationSchemas.js";
 import Farmer from "../models/farmerModel.js";
+import FarmerProfile from "../models/farmerProfile.js";
+import FarmerAccount from "../models/farmerAccount.js";
 import Request from "../models/requestModel.js";
 import generateUniqueAlphaNumeric from "../utils/farmers/generateUniqueAlphaNumeric.js";
 import { formatFarmerName, formatName } from "../utils/helpers.js";
@@ -682,82 +684,135 @@ const quickRegisterFarmer = async (req, reply) => {
     // Validate the request body
     const storeAdminId = req.storeAdmin._id;
     quickRegisterSchema.parse(req.body);
+
+    // Extract data from the request body
+    const { name, fatherName, address, mobileNumber, password, imageUrl, farmerId, variety } = req.body;
+    const formattedName = formatFarmerName(name);
+
     // Check if farmerId is present
-    if (!req.body.farmerId) {
+    if (!farmerId) {
       req.log.warn("FarmerId is missing in the request body");
       return reply.code(400).send({
         status: "Fail",
         message: "FarmerId is required",
       });
     }
-    // Extract data from the request body
-    const { name, address, mobileNumber, password, imageUrl, farmerId } = req.body;
-    const formattedName = formatFarmerName(name);
-    // Log farmer existence check
-    req.log.info("Checking if farmer already exists", { mobileNumber });
-    // Check if a farmer with the given mobile number already exists
-    const farmerExists = await Farmer.findOne({ mobileNumber });
-    if (farmerExists) {
-      req.log.warn("Farmer already exists with this mobile number", { mobileNumber });
+
+    // Check if variety is present
+    if (!variety) {
+      req.log.warn("Variety is missing in the request body");
       return reply.code(400).send({
         status: "Fail",
-        message: "Farmer already exists with this mobile number",
+        message: "Variety is required",
       });
     }
-    // Check for unique combination of farmerId and first registeredStoreAdmin
-    const existingFarmer = await Farmer.findOne({
+
+    // Check if a farmer profile with the given mobile number already exists (if mobile number provided)
+    if (mobileNumber) {
+      const existingProfile = await FarmerProfile.findOne({ mobileNumber });
+      if (existingProfile) {
+        req.log.warn("Farmer profile already exists with this mobile number", { mobileNumber });
+        return reply.code(400).send({
+          status: "Fail",
+          message: "Farmer profile already exists with this mobile number",
+        });
+      }
+    }
+
+    // Check for unique combination of farmerId, variety and storeAdmin
+    const existingFarmerAccount = await FarmerAccount.findOne({
       farmerId: farmerId,
-      registeredStoreAdmins: { $elemMatch: { $eq: storeAdminId } }
+      storeAdmin: storeAdminId,
+      variety: variety
     });
-    if (existingFarmer) {
-      req.log.warn("Farmer ID already registered with this cold storage", {
+    if (existingFarmerAccount) {
+      req.log.warn("Farmer ID already registered with this cold storage for this variety", {
         farmerId,
-        storeAdminId
+        storeAdminId,
+        variety
       });
       return reply.code(400).send({
         status: "Fail",
-        message: "This Farmer ID is already registered under this cold storage. Please either change the Farmer ID or register with a different cold storage."
+        message: "This Farmer ID is already registered under this cold storage for this variety. Please either change the Farmer ID or variety or register with a different cold storage."
       });
     }
+
     // Hash the password
     const hashedPassword = await bcrypt.hash(password, 10);
     req.log.info("Password hashed successfully");
-    // Create the new farmer record
-    req.log.info("Creating new farmer record", {
-      name,
-      mobileNumber,
-      farmerId,
-      storeAdminId
-    });
-    const farmer = await Farmer.create({
+
+    // Create or find farmer profile
+    let farmerProfile;
+    if (mobileNumber) {
+      // Create new profile if mobile number provided
+      farmerProfile = await FarmerProfile.create({
+        name: formattedName,
+        fatherName,
+        address,
+        mobileNumber,
+        imageUrl: imageUrl || ""
+      });
+    } else {
+      // Check if profile exists with same name and father name
+      farmerProfile = await FarmerProfile.findOne({
+        name: formattedName,
+        fatherName
+      });
+
+      if (!farmerProfile) {
+        // Create new profile without mobile number
+        farmerProfile = await FarmerProfile.create({
+          name: formattedName,
+          fatherName,
+          address,
+          imageUrl: imageUrl || ""
+        });
+      }
+    }
+
+    // Create the new farmer account
+    req.log.info("Creating new farmer account", {
       name: formattedName,
-      address,
-      mobileNumber,
-      password: hashedPassword,
-      imageUrl,
       farmerId,
-      isVerified: false,
-      registeredStoreAdmins: [storeAdminId]
+      storeAdminId,
+      variety
     });
-    if (farmer) {
+
+    const farmerAccount = await FarmerAccount.create({
+      profile: farmerProfile._id,
+      storeAdmin: storeAdminId,
+      variety,
+      farmerId,
+      password: hashedPassword,
+      isVerified: false,
+      role: "user"
+    });
+
+    if (farmerAccount) {
       // Update store admin's registeredFarmers array
       await StoreAdmin.findByIdAndUpdate(
         storeAdminId,
-        { $addToSet: { registeredFarmers: farmer._id } },
+        { $addToSet: { registeredFarmers: farmerAccount._id } },
         { new: true }
       );
-      req.log.info("Farmer registered successfully", {
-        farmerId: farmer.farmerId,
-        storeAdminId
+
+      req.log.info("Farmer account registered successfully", {
+        farmerId: farmerAccount.farmerId,
+        storeAdminId,
+        variety
       });
+
       return reply.code(201).send({
         status: "Success",
         message: "Farmer registered successfully",
         data: {
-          _id: farmer._id, // Added mongoose object id
-          farmerId: farmer.farmerId,
-          name: farmer.name,
-          mobileNumber: farmer.mobileNumber
+          _id: farmerAccount._id,
+          farmerId: farmerAccount.farmerId,
+          name: farmerProfile.name,
+          fatherName: farmerProfile.fatherName,
+          mobileNumber: farmerProfile.mobileNumber,
+          variety: farmerAccount.variety,
+          profileId: farmerProfile._id
         }
       });
     }
@@ -778,16 +833,16 @@ const getFarmersIdsForCheck = async (req, reply) => {
     // Get the store admin document with populated registeredFarmers
     const storeAdmin = await StoreAdmin.findById(req.storeAdmin._id);
 
-    // Filter out any non-existent farmers and get their IDs
+    // Filter out any non-existent farmer accounts and get their IDs
     const validFarmerIds = [];
     const invalidFarmerIds = [];
 
-    for (const farmerId of storeAdmin.registeredFarmers) {
-      const farmerExists = await Farmer.findById(farmerId);
-      if (farmerExists) {
-        validFarmerIds.push(farmerExists.farmerId);
+    for (const farmerAccountId of storeAdmin.registeredFarmers) {
+      const farmerAccountExists = await FarmerAccount.findById(farmerAccountId);
+      if (farmerAccountExists) {
+        validFarmerIds.push(farmerAccountExists.farmerId);
       } else {
-        invalidFarmerIds.push(farmerId);
+        invalidFarmerIds.push(farmerAccountId);
       }
     }
 

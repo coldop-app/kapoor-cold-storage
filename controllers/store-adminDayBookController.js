@@ -202,16 +202,15 @@ const dayBookOrderController = async (req, reply) => {};
 
 const testController = async (req, reply) => {
   try {
-    const orders = await Order.find({
-      coldStorageId: { $ne: new mongoose.Types.ObjectId("66e1f22d782bbd67d3446805") }
-    });
-    console.log("Orders: ", orders);
     reply.code(200).send({
-      message: "test controller",
-      orders: orders,
+      message: "kapoor test",
     });
   } catch (err) {
-    console.error(err.message);
+    reply.code(500).send({
+      status: "Fail",
+      message: "Some error occurred while getting daybook orders",
+      errorMessage: err.message,
+    });
   }
 };
 

@@ -87,16 +87,19 @@ const farmerIdSchema = z.object({
 
 const quickRegisterSchema = z.object({
   name: z.string().min(2).max(50),
+  fatherName: z.string().min(2).max(50),
   address: z.string().min(2).max(100),
-  mobileNumber: z.string().length(10),
+  mobileNumber: z.string().length(10).optional(),
   password: z.string().min(6),
+  variety: z.string().min(1),
+  farmerId: z.string().min(1),
 });
 
 const orderSchema = z.object({
   coldStorageId: z.string().regex(/^[a-fA-F0-9]{24}$/, "Invalid ObjectId"),
   farmerId: z.string().regex(/^[a-fA-F0-9]{24}$/, "Invalid ObjectId"),
   dateOfSubmission: z.string().min(1),
-  remarks: z.string().optional(), 
+  remarks: z.string().optional(),
   orderDetails: z.array(
     z.object({
       variety: z.string().min(1),

@@ -2,7 +2,7 @@ import fastify from "fastify";
 import swagger from "@fastify/swagger";
 import swaggerUi from "@fastify/swagger-ui";
 import farmerRoutes from "./routes/farmerRoutes.js";
-import acceptsSerializer from "@fastify/accepts-serializer";
+import kapoorRoutes from "./routes/kapoorRoutes.js";
 import connectDB from "./config/db.js";
 import dotenv from "dotenv";
 import formBody from "@fastify/formbody";
@@ -100,6 +100,7 @@ const start = async () => {
   await app.register(formBody);
   await app.register(farmerRoutes, { prefix: "/api/farmers" });
   await app.register(storeAdminRoutes, { prefix: "/api/store-admin" });
+  await app.register(kapoorRoutes, { prefix: "/api/store-admin/kapoor" });
   await app.register(superAdminRoutes, { prefix: "/api/super-admin" });
   await app.register(countRoutes, { prefix: "/api/count" });
 
