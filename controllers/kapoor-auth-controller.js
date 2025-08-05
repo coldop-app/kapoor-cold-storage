@@ -10,6 +10,7 @@ import bcrypt from "bcryptjs";
 import FarmerProfile from "../models/farmerProfile.js";
 import FarmerAccount from "../models/farmerAccount.js";
 import StoreAdmin from "../models/storeAdminModel.js";
+import KapoorIncomingOrder from "../models/kapoor-incoming-model.js";
 
 const quickRegisterFarmer = async (req, reply) => {
   try {
@@ -248,4 +249,127 @@ const searchFarmerProfiles = async (req, reply) => {
   }
 };
 
-export { quickRegisterFarmer, getFarmersIdsForCheck, getAllFarmerProfiles, getAccountsForFarmerProfile, searchFarmerProfiles };
+const createIncomingOrder = async (req, reply) => {
+  try {
+    const storeAdminId = req.storeAdmin._id;
+
+    const {
+      farmerAccount,
+      variety,
+      voucherNumber,
+      incomingBagSizes,
+      dateOfEntry,
+      remarks,
+    } = req.body;
+
+    // Validate required fields
+    if (!farmerAccount || !variety || !voucherNumber || !incomingBagSizes || !dateOfEntry) {
+      return reply.code(400).send({
+        status: "Fail",
+        message: "Missing required fields: farmerAccount, variety, voucherNumber, incomingBagSizes, dateOfEntry",
+      });
+    }
+
+    // Validate incomingBagSizes structure
+    if (!Array.isArray(incomingBagSizes) || incomingBagSizes.length === 0) {
+      return reply.code(400).send({
+        status: "Fail",
+        message: "incomingBagSizes must be a non-empty array",
+      });
+    }
+
+    // Validate each bag size object
+    for (const bagSize of incomingBagSizes) {
+      if (!bagSize.size || !bagSize.quantity || !bagSize.location) {
+        return reply.code(400).send({
+          status: "Fail",
+          message: "Each bag size must have size, quantity, and location fields",
+        });
+      }
+
+      if (typeof bagSize.quantity !== 'number' || bagSize.quantity <= 0) {
+        return reply.code(400).send({
+          status: "Fail",
+          message: "Quantity must be a positive number",
+        });
+      }
+    }
+
+    // Check if farmer account exists and belongs to this store admin
+    const farmerAccountDoc = await FarmerAccount.findOne({
+      _id: farmerAccount,
+      storeAdmin: storeAdminId,
+    });
+
+    if (!farmerAccountDoc) {
+      return reply.code(404).send({
+        status: "Fail",
+        message: "Farmer account not found or does not belong to this store",
+      });
+    }
+
+    // Check if voucher number already exists for this store
+    const existingOrder = await KapoorIncomingOrder.findOne({
+      coldStorageId: storeAdminId,
+      "voucher.voucherNumber": voucherNumber,
+    });
+
+    if (existingOrder) {
+      return reply.code(400).send({
+        status: "Fail",
+        message: "Voucher number already exists for this store",
+      });
+    }
+
+    // Create the incoming order
+    const newIncomingOrder = await KapoorIncomingOrder.create({
+      coldStorageId: storeAdminId,
+      farmerAccount: farmerAccount,
+      variety: variety,
+      voucher: {
+        type: "RECEIPT",
+        voucherNumber: voucherNumber,
+      },
+      incomingBagSizes: incomingBagSizes,
+      dateOfEntry: dateOfEntry,
+      remarks: remarks || "",
+      createdBy: storeAdminId,
+    });
+
+    req.log.info("Incoming order created successfully", {
+      orderId: newIncomingOrder._id,
+      storeAdminId: storeAdminId,
+      farmerAccount: farmerAccount,
+      voucherNumber: voucherNumber,
+    });
+
+    return reply.code(201).send({
+      status: "Success",
+      message: "Incoming order created successfully",
+      data: {
+        _id: newIncomingOrder._id,
+        coldStorageId: newIncomingOrder.coldStorageId,
+        farmerAccount: newIncomingOrder.farmerAccount,
+        variety: newIncomingOrder.variety,
+        voucher: newIncomingOrder.voucher,
+        incomingBagSizes: newIncomingOrder.incomingBagSizes,
+        dateOfEntry: newIncomingOrder.dateOfEntry,
+        remarks: newIncomingOrder.remarks,
+        createdAt: newIncomingOrder.createdAt,
+      },
+    });
+
+  } catch (err) {
+    req.log.error("Error occurred during incoming order creation", {
+      error: err.message,
+    });
+
+    return reply.code(500).send({
+      status: "Fail",
+      message: "Some error occurred while creating incoming order",
+      errorMessage: err.message,
+    });
+  }
+};
+
+export { quickRegisterFarmer, getFarmersIdsForCheck, getAllFarmerProfiles, getAccountsForFarmerProfile, searchFarmerProfiles, createIncomingOrder };
