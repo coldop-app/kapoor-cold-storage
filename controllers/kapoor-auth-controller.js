@@ -140,46 +140,59 @@ const quickRegisterFarmer = async (req, reply) => {
 
 const getFarmersIdsForCheck = async (req, reply) => {
   try {
-    // Get the store admin document with populated registeredFarmers
-    const storeAdmin = await StoreAdmin.findById(req.storeAdmin._id);
+    const storeAdminId = req.storeAdmin._id;
 
-    // Filter out any non-existent farmers and get their IDs
-    const validFarmerIds = [];
-    const invalidFarmerIds = [];
+    // Get all farmer accounts for this store admin
+    const farmerAccounts = await FarmerAccount.find({ storeAdmin: storeAdminId })
+      .select('farmerId');
 
-    for (const farmerId of storeAdmin.registeredFarmers) {
-      const farmerAccountExists = await FarmerAccount.findById(farmerId);
-      if (farmerAccountExists) {
-        validFarmerIds.push(farmerAccountExists.farmerId);
-      } else {
-        invalidFarmerIds.push(farmerId);
-      }
-    }
+    // Extract unique farmerIds
+    const usedFarmerIds = [...new Set(farmerAccounts.map(account => account.farmerId))];
 
-    // If there were any invalid IDs, remove them from the store admin's registeredFarmers
-    if (invalidFarmerIds.length > 0) {
-      await StoreAdmin.findByIdAndUpdate(req.storeAdmin._id, {
-        $pull: { registeredFarmers: { $in: invalidFarmerIds } },
-      });
-    }
+    req.log.info("Retrieved farmer IDs for store admin", {
+      storeAdminId,
+      totalFarmers: usedFarmerIds.length
+    });
 
     reply.code(200).send({
       status: "Success",
       data: {
-        registeredFarmers: validFarmerIds,
+        registeredFarmers: usedFarmerIds,
       },
     });
   } catch (err) {
+    req.log.error("Error occurred while fetching farmer IDs", {
+      error: err.message,
+    });
     reply.code(500).send({
       status: "Fail",
-      message: err.message,
+      message: "Failed to fetch farmer IDs",
+      errorMessage: err.message,
     });
   }
 };
 
 const getAllFarmerProfiles = async (req, reply) => {
   try {
-    const profiles = await FarmerProfile.find({});
+    const storeAdminId = req.storeAdmin._id;
+
+    // Get all farmer accounts for this store admin
+    const farmerAccounts = await FarmerAccount.find({ storeAdmin: storeAdminId })
+      .select('profile');
+
+    // Extract unique profile IDs
+    const profileIds = [...new Set(farmerAccounts.map(account => account.profile))];
+
+    // If no farmers are registered with this store admin, return empty result
+    if (profileIds.length === 0) {
+      return reply.code(200).send({
+        status: "Success",
+        data: [],
+      });
+    }
+
+    // Get farmer profiles that belong to this store admin
+    const profiles = await FarmerProfile.find({ _id: { $in: profileIds } });
     return reply.code(200).send({
       status: "Success",
       data: profiles,
@@ -218,23 +231,43 @@ const getAccountsForFarmerProfile = async (req, reply) => {
 
 const searchFarmerProfiles = async (req, reply) => {
   try {
-    const { name, fatherName, mobileNumber } = req.query;
-    const query = {};
-    if (name) {
-      query.name = { $regex: name, $options: "i" };
-    }
-    if (fatherName) {
-      query.fatherName = { $regex: fatherName, $options: "i" };
-    }
-    if (mobileNumber) {
-      query.mobileNumber = { $regex: mobileNumber, $options: "i" };
-    }
-    if (Object.keys(query).length === 0) {
+    const { searchQuery } = req.query;
+    const storeAdminId = req.storeAdmin._id;
+
+    if (!searchQuery || searchQuery.trim() === '') {
       return reply.code(400).send({
         status: "Fail",
-        message: "At least one search parameter (name, fatherName, mobileNumber) is required."
+        message: "Search query is required."
       });
     }
+
+    const trimmedQuery = searchQuery.trim();
+
+    // First, get all farmer accounts for this store admin
+    const farmerAccounts = await FarmerAccount.find({ storeAdmin: storeAdminId })
+      .select('profile');
+
+    // Extract unique profile IDs
+    const profileIds = [...new Set(farmerAccounts.map(account => account.profile))];
+
+    // If no farmers are registered with this store admin, return empty result
+    if (profileIds.length === 0) {
+      return reply.code(200).send({
+        status: "Success",
+        data: [],
+      });
+    }
+
+    // Search farmer profiles that belong to this store admin
+    const query = {
+      _id: { $in: profileIds },
+      $or: [
+        { name: { $regex: trimmedQuery, $options: "i" } },
+        { fatherName: { $regex: trimmedQuery, $options: "i" } },
+        { mobileNumber: { $regex: trimmedQuery, $options: "i" } }
+      ]
+    };
+
     const profiles = await FarmerProfile.find(query);
     return reply.code(200).send({
       status: "Success",
@@ -372,4 +405,190 @@ const createIncomingOrder = async (req, reply) => {
   }
 };
 
-export { quickRegisterFarmer, getFarmersIdsForCheck, getAllFarmerProfiles, getAccountsForFarmerProfile, searchFarmerProfiles, createIncomingOrder };
+const getReceiptVoucherNumbers = async (req, reply) => {
+  try {
+    const storeAdminId = req.storeAdmin._id;
+
+    // Get all receipt voucher numbers for this cold storage
+    const voucherNumbers = await KapoorIncomingOrder.find({
+      coldStorageId: storeAdminId,
+    })
+    .select('voucher.voucherNumber voucher.type dateOfEntry variety')
+    .sort({ 'voucher.voucherNumber': 1 });
+
+    req.log.info("Retrieved receipt voucher numbers successfully", {
+      storeAdminId: storeAdminId,
+      count: voucherNumbers.length,
+    });
+
+    return reply.code(200).send({
+      status: "Success",
+      receiptNumber: voucherNumbers.length
+    });
+
+  } catch (err) {
+    req.log.error("Error occurred while retrieving receipt voucher numbers", {
+      error: err.message,
+    });
+
+    return reply.code(500).send({
+      status: "Fail",
+      message: "Failed to retrieve receipt voucher numbers",
+      errorMessage: err.message,
+    });
+  }
+};
+
+const getKapoorIncomingOrders = async (req, reply) => {
+  try {
+    const coldStorageId = req.storeAdmin._id;
+    const { sortBy } = req.query;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const sortOrder = sortBy === "latest" ? -1 : 1;
+
+    const skip = (page - 1) * limit;
+
+    // Helper function to sort bag sizes
+    const sortOrderDetails = (orders) => {
+      return orders.map((order) => {
+        const orderObj = order.toObject();
+        if (orderObj.incomingBagSizes) {
+          orderObj.incomingBagSizes = orderObj.incomingBagSizes.sort((a, b) =>
+            a.size.localeCompare(b.size)
+          );
+        }
+        return orderObj;
+      });
+    };
+
+    // Helper function to create pagination metadata
+    const createPaginationMeta = (total, page, limit) => {
+      const totalPages = Math.ceil(total / limit);
+      return {
+        currentPage: page,
+        totalPages,
+        totalItems: total,
+        itemsPerPage: limit,
+        hasNextPage: page < totalPages,
+        hasPreviousPage: page > 1,
+        nextPage: page < totalPages ? page + 1 : null,
+        previousPage: page > 1 ? page - 1 : null,
+      };
+    };
+
+    req.log.info("Getting kapoor incoming orders", {
+      coldStorageId,
+      sortBy,
+      page,
+      limit,
+      sortOrder
+    });
+
+    // Get total count for pagination
+    const totalCount = await KapoorIncomingOrder.countDocuments({ coldStorageId });
+
+    if (totalCount === 0) {
+      req.log.info("No incoming orders found for the cold storage");
+      return reply.code(200).send({
+        status: "Fail",
+        message: "No incoming orders found.",
+        pagination: createPaginationMeta(0, page, limit),
+      });
+    }
+
+    const incomingOrders = await KapoorIncomingOrder.find({ coldStorageId })
+      .skip(skip)
+      .limit(limit)
+      .sort({ createdAt: sortOrder })
+      .populate({
+        path: "farmerAccount",
+        model: FarmerAccount,
+        populate: {
+          path: "profile",
+          model: "FarmerProfile",
+          select: "name mobileNumber address"
+        },
+        select: "farmerId variety profile"
+      })
+      .select(
+        "_id coldStorageId remarks farmerAccount variety voucher incomingBagSizes dateOfEntry createdAt"
+      );
+
+    const sortedOrders = sortOrderDetails(incomingOrders);
+
+    req.log.info("Kapoor incoming orders retrieved successfully", {
+      count: sortedOrders.length,
+      totalCount
+    });
+
+    reply.code(200).send({
+      status: "Success",
+      data: sortedOrders,
+      pagination: createPaginationMeta(totalCount, page, limit),
+    });
+
+  } catch (err) {
+    req.log.error("Error getting kapoor incoming orders:", {
+      error: err.message,
+    });
+
+    reply.code(500).send({
+      status: "Fail",
+      message: "Some error occurred while getting kapoor incoming orders",
+      errorMessage: err.message,
+    });
+  }
+};
+
+/**
+ * Get all incoming orders for a single farmer (by FarmerAccount IDs)
+ * Expects req.body.farmerAccountIds: Array of FarmerAccount mongoose IDs
+ */
+const getAllIncomingOrdersOfASingleFarmer = async (req, reply) => {
+  try {
+    const { farmerAccountIds } = req.body;
+    if (!Array.isArray(farmerAccountIds) || farmerAccountIds.length === 0) {
+      return reply.code(400).send({
+        status: "Fail",
+        message: "farmerAccountIds (array) is required in request body",
+      });
+    }
+
+    // Query all incoming orders where farmerAccount is in the provided IDs
+    const orders = await KapoorIncomingOrder.find({
+      farmerAccount: { $in: farmerAccountIds },
+    })
+      .populate({
+        path: "farmerAccount",
+        model: FarmerAccount,
+        populate: {
+          path: "profile",
+          model: "FarmerProfile",
+          select: "name mobileNumber address"
+        },
+        select: "farmerId variety profile"
+      })
+      .select(
+        "_id coldStorageId remarks farmerAccount variety voucher incomingBagSizes dateOfEntry createdAt"
+      )
+      .sort({ createdAt: -1 });
+
+    return reply.code(200).send({
+      status: "Success",
+      data: orders,
+      count: orders.length,
+    });
+  } catch (err) {
+    req.log.error("Error getting incoming orders for farmer:", {
+      error: err.message,
+    });
+    return reply.code(500).send({
+      status: "Fail",
+      message: "Some error occurred while getting incoming orders for farmer",
+      errorMessage: err.message,
+    });
+  }
+};
+
+export { quickRegisterFarmer, getFarmersIdsForCheck, getAllFarmerProfiles, getAccountsForFarmerProfile, searchFarmerProfiles, createIncomingOrder, getReceiptVoucherNumbers, getKapoorIncomingOrders, getAllIncomingOrdersOfASingleFarmer };
