@@ -1,3 +1,4 @@
+import KapoorOutgoingOrder from "../models/kapoor-outgoing-order-model.js";
 import Order from "../models/orderModel.js";
 import OutgoingOrder from "../models/outgoingOrderModel.js";
 import mongoose from "mongoose";
@@ -69,7 +70,7 @@ export const getReceiptNumberHelper = async (storeAdminId) => {
 
 export const getDeliveryVoucherNumberHelper = async (storeAdminId) => {
   try {
-    const result = await OutgoingOrder.aggregate([
+    const result = await KapoorOutgoingOrder.aggregate([
       {
         $match: {
           coldStorageId:  new mongoose.Types.ObjectId(storeAdminId),

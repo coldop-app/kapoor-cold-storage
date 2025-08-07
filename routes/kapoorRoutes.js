@@ -2,7 +2,7 @@
 import {
   testController,
 } from "../controllers/store-adminDayBookController.js";
-import { quickRegisterFarmer, getFarmersIdsForCheck, getAllFarmerProfiles, getKapoorDaybookOrders,getAccountsForFarmerProfile, searchFarmerProfiles, createIncomingOrder, getReceiptVoucherNumbers,  getAllIncomingOrdersOfASingleFarmer } from "../controllers/kapoor-auth-controller.js";
+import { quickRegisterFarmer, getFarmersIdsForCheck, getAllFarmerProfiles, getKapoorDaybookOrders,getAccountsForFarmerProfile, searchFarmerProfiles, createIncomingOrder, getReceiptVoucherNumbers,  getAllIncomingOrdersOfASingleFarmer, createOutgoingOrder } from "../controllers/kapoor-auth-controller.js";
 import { storeAdminProtect } from "../middleware/authMiddleware.js";
 
 function kapoorRoutes(fastify, options, done) {
@@ -29,6 +29,8 @@ function kapoorRoutes(fastify, options, done) {
 
   // Get all incoming orders for a single farmer (by FarmerAccount IDs)
   fastify.post("/incoming-orders/single-farmer", { preHandler: [storeAdminProtect] }, getAllIncomingOrdersOfASingleFarmer);
+
+  fastify.post("/outgoing-orders/:id", { preHandler: [storeAdminProtect] }, createOutgoingOrder);
 
   done();
 }

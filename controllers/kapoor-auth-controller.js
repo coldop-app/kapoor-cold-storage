@@ -12,6 +12,7 @@ import StoreAdmin from "../models/storeAdminModel.js";
 import KapoorIncomingOrder from "../models/kapoor-incoming-model.js";
 import KapoorOutgoingOrder from "../models/kapoor-outgoing-order-model.js";
 import mongoose from "mongoose";
+import { getDeliveryVoucherNumberHelper, formatDate, formatFarmerName } from "../utils/helpers.js";
 
 // Helper function to calculate current stock for KapoorIncomingOrder
 const getCurrentStockForKapoor = async (coldStorageId, req) => {
@@ -961,5 +962,184 @@ const getAllIncomingOrdersOfASingleFarmer = async (req, reply) => {
 };
 
 
+// Modified createOutgoingOrder controller for Kapoor model structure
+const createOutgoingOrder = async (req, reply) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
 
-export { quickRegisterFarmer, getFarmersIdsForCheck, getAllFarmerProfiles, getAccountsForFarmerProfile, searchFarmerProfiles, createIncomingOrder, getReceiptVoucherNumbers, getKapoorDaybookOrders, getAllIncomingOrdersOfASingleFarmer,};
+  try {
+    const { orders, remarks } = req.body;
+    const { id } = req.params;
+
+    if (!Array.isArray(orders) || orders.length === 0) {
+      throw new Error("Orders array is required and cannot be empty");
+    }
+
+    // Fetch incoming orders to validate and build map
+    const incomingOrders = await Promise.all(
+      orders.map(async ({ orderId, variety, bagUpdates }) => {
+        const fetchedOrder = await KapoorIncomingOrder.findById(orderId).lean();
+        if (!fetchedOrder) throw new Error(`Order ${orderId} not found`);
+
+        // Model does not have orderDetails, so use variety and incomingBagSizes
+        if (fetchedOrder.variety !== variety) {
+          throw new Error(`Variety ${variety} not found in order ${orderId}`);
+        }
+        const matchingDetail = {
+          variety: fetchedOrder.variety,
+          bagSizes: fetchedOrder.incomingBagSizes,
+        };
+
+        bagUpdates.forEach(({ size, location, quantityToRemove }) => {
+          const match = matchingDetail.bagSizes.find(
+            (b) => b.size === size && b.location === location
+          );
+          if (!match) throw new Error(`Size ${size} at ${location} not found`);
+          if (match.quantity < quantityToRemove) {
+            throw new Error(`Insufficient stock for ${variety} ${size} at ${location}`);
+          }
+        });
+
+        return {
+          _id: fetchedOrder._id,
+          voucher: fetchedOrder.voucher,
+          orderDetails: [
+            {
+              variety,
+              bagSizes: matchingDetail.bagSizes,
+            },
+          ],
+          // Add a mapped version for use in outgoingOrderDetails
+          mappedIncomingBagSizes: fetchedOrder.incomingBagSizes.map(bag => ({
+            size: bag.size,
+            initialQuantity: bag.quantity,
+            currentQuantity: bag.quantity,
+            location: bag.location,
+          })),
+        };
+      })
+    );
+
+    const incomingOrderMap = Object.fromEntries(
+      incomingOrders.map((o) => [o._id.toString(), o])
+    );
+
+    const bulkOps = [];
+    const outgoingOrderDetails = orders.map(({ orderId, variety, bagUpdates }) => {
+      const bagSizes = bagUpdates
+        .filter((u) => u.quantityToRemove > 0)
+        .map(({ size, location, quantityToRemove }) => {
+          bulkOps.push({
+            updateOne: {
+              filter: {
+                _id: new mongoose.Types.ObjectId(orderId),
+                variety: variety,
+                "incomingBagSizes.size": size,
+                "incomingBagSizes.location": location,
+              },
+              update: {
+                $inc: {
+                  "incomingBagSizes.$[j].quantity": -quantityToRemove,
+                },
+              },
+              arrayFilters: [
+                { "j.size": size, "j.location": location },
+              ],
+            },
+          });
+
+          return {
+            size,
+            location,
+            quantityRemoved: quantityToRemove,
+          };
+        });
+
+      // Use mappedIncomingBagSizes for the required structure
+      return {
+        variety,
+        incomingOrder: {
+          _id: orderId,
+          voucher: incomingOrderMap[orderId]?.voucher,
+          incomingBagSizes: incomingOrderMap[orderId]?.mappedIncomingBagSizes || [],
+        },
+        bagSizes,
+      };
+    });
+
+    // Bulk update incoming orders to decrement stock
+    if (bulkOps.length > 0) {
+      await KapoorIncomingOrder.bulkWrite(bulkOps, { session });
+    }
+
+    // Get delivery voucher number (assuming helper exists)
+    const deliveryVoucherNumber = await getDeliveryVoucherNumberHelper(
+      req.storeAdmin._id
+    );
+
+    // Calculate total current stock from all incoming orders
+    const totalIncomingStock = await KapoorIncomingOrder.aggregate([
+      {
+        $match: {
+          coldStorageId: new mongoose.Types.ObjectId(req.storeAdmin._id),
+        },
+      },
+      { $unwind: "$incomingBagSizes" },
+      {
+        $group: {
+          _id: null,
+          totalCurrentQuantity: { $sum: "$incomingBagSizes.quantity" },
+        },
+      },
+    ]);
+    const incomingTotal = totalIncomingStock.length > 0 ? totalIncomingStock[0].totalCurrentQuantity : 0;
+
+    // Calculate current outgoing order total
+    const currentOutgoingTotal = orders.reduce((total, order) => {
+      const orderTotal = order.bagUpdates.reduce((bagTotal, update) => {
+        return bagTotal + update.quantityToRemove;
+      }, 0);
+      return total + orderTotal;
+    }, 0);
+
+    // Calculate currentStockAtThatTime
+    const currentStockAtThatTime = incomingTotal - currentOutgoingTotal;
+
+    const outgoingOrder = new KapoorOutgoingOrder({
+      coldStorageId: req.storeAdmin._id,
+      farmerAccount: id,
+      voucher: {
+        type: "DELIVERY",
+        voucherNumber: deliveryVoucherNumber,
+      },
+      dateOfExtraction: formatDate(new Date()),
+      orderDetails: outgoingOrderDetails,
+      currentStockAtThatTime,
+      remarks,
+      createdBy: req.storeAdmin._id,
+    });
+
+    await outgoingOrder.save({ session });
+    await session.commitTransaction();
+    session.endSession();
+
+    return reply.code(200).send({
+      status: "Success",
+      message: "Outgoing order created successfully",
+      outgoingOrder,
+    });
+  } catch (err) {
+    await session.abortTransaction();
+    session.endSession();
+
+    return reply.code(500).send({
+      status: "Fail",
+      message: "Error creating outgoing order",
+      errorMessage: err.message,
+    });
+  }
+};
+
+
+
+export { quickRegisterFarmer, getFarmersIdsForCheck, getAllFarmerProfiles, getAccountsForFarmerProfile, searchFarmerProfiles, createIncomingOrder, getReceiptVoucherNumbers, getKapoorDaybookOrders, getAllIncomingOrdersOfASingleFarmer, createOutgoingOrder};
