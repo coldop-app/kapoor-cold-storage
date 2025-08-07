@@ -5,12 +5,57 @@ import {
   quickRegisterSchema,
   farmerIdSchema,
 } from "../utils/validationSchemas.js";
-import { formatFarmerName, formatName } from "../utils/helpers.js";
+import { formatFarmerName, formatName, getReceiptNumberHelper, getKapoorReceiptNumberHelper } from "../utils/helpers.js";
 import bcrypt from "bcryptjs";
 import FarmerProfile from "../models/farmerProfile.js";
 import FarmerAccount from "../models/farmerAccount.js";
 import StoreAdmin from "../models/storeAdminModel.js";
 import KapoorIncomingOrder from "../models/kapoor-incoming-model.js";
+import KapoorOutgoingOrder from "../models/kapoor-outgoing-order-model.js";
+import mongoose from "mongoose";
+
+// Helper function to calculate current stock for KapoorIncomingOrder
+const getCurrentStockForKapoor = async (coldStorageId, req) => {
+  try {
+    req.log.info("Calculating current stock for Kapoor helper function", {
+      coldStorageId,
+      requestId: req.id,
+    });
+
+    // Validate MongoDB ObjectId
+    if (!mongoose.Types.ObjectId.isValid(coldStorageId)) {
+      throw new Error("Invalid ID format");
+    }
+
+    // Aggregate incoming orders to sum quantities
+    const result = await KapoorIncomingOrder.aggregate([
+      {
+        $match: {
+          coldStorageId: new mongoose.Types.ObjectId(coldStorageId),
+        },
+      },
+      { $unwind: "$incomingBagSizes" },
+      {
+        $group: {
+          _id: null,
+          totalCurrentQuantity: {
+            $sum: "$incomingBagSizes.quantity",
+          },
+        },
+      },
+    ]);
+
+    return result.length > 0 ? result[0].totalCurrentQuantity : 0;
+  } catch (error) {
+    req.log.error("Error in calculate current stock helper for Kapoor", {
+      error: error.message,
+      stack: error.stack,
+      coldStorageId,
+      requestId: req.id,
+    });
+    throw error;
+  }
+};
 
 const quickRegisterFarmer = async (req, reply) => {
   try {
@@ -289,17 +334,35 @@ const createIncomingOrder = async (req, reply) => {
     const {
       farmerAccount,
       variety,
-      voucherNumber,
       incomingBagSizes,
-      dateOfEntry,
       remarks,
     } = req.body;
 
     // Validate required fields
-    if (!farmerAccount || !variety || !voucherNumber || !incomingBagSizes || !dateOfEntry) {
+    if (!farmerAccount || !variety || !incomingBagSizes) {
       return reply.code(400).send({
         status: "Fail",
-        message: "Missing required fields: farmerAccount, variety, voucherNumber, incomingBagSizes, dateOfEntry",
+        message: "Missing required fields: farmerAccount, variety, incomingBagSizes",
+      });
+    }
+
+    // Format current date to DD.MM.YY
+    const formattedDate = new Date()
+      .toLocaleDateString("en-GB", {
+        day: "2-digit",
+        month: "2-digit",
+        year: "2-digit",
+      })
+      .split("/")
+      .join(".");
+
+    // Get receipt number
+    const receiptNumber = await getKapoorReceiptNumberHelper(storeAdminId);
+
+    if (!receiptNumber) {
+      return reply.code(500).send({
+        status: "Fail",
+        message: "Failed to get RECEIPT number",
       });
     }
 
@@ -344,7 +407,7 @@ const createIncomingOrder = async (req, reply) => {
     // Check if voucher number already exists for this store
     const existingOrder = await KapoorIncomingOrder.findOne({
       coldStorageId: storeAdminId,
-      "voucher.voucherNumber": voucherNumber,
+      "voucher.voucherNumber": receiptNumber,
     });
 
     if (existingOrder) {
@@ -354,6 +417,66 @@ const createIncomingOrder = async (req, reply) => {
       });
     }
 
+    // Calculate the existing stock
+    let existingStock;
+    try {
+      existingStock = await getCurrentStockForKapoor(storeAdminId, req);
+
+      req.log.info("Calculated existing stock", {
+        existingStock,
+        storeAdminId,
+        requestId: req.id,
+      });
+    } catch (error) {
+      req.log.error("Error calculating existing stock", {
+        error: error.message,
+        storeAdminId,
+        requestId: req.id,
+      });
+      return reply.code(500).send({
+        status: "Fail",
+        message: "Error calculating current stock",
+        errorMessage: error.message,
+      });
+    }
+
+    // Calculate additional stock from the current order
+    let additionalStock = 0;
+    try {
+      additionalStock = incomingBagSizes.reduce(
+        (sum, bag) => sum + (bag.quantity || 0),
+        0
+      );
+
+      req.log.info("Calculated additional stock from current order", {
+        additionalStock,
+        storeAdminId,
+        requestId: req.id,
+      });
+    } catch (error) {
+      req.log.error("Error calculating additional stock", {
+        error: error.message,
+        storeAdminId,
+        requestId: req.id,
+      });
+      return reply.code(500).send({
+        status: "Fail",
+        message: "Error calculating additional stock from current order",
+        errorMessage: error.message,
+      });
+    }
+
+    // Combine existing stock with the new order's stock
+    const currentStockAtThatTime = existingStock + additionalStock;
+
+    req.log.info("Final current stock calculation", {
+      existingStock,
+      additionalStock,
+      currentStockAtThatTime,
+      storeAdminId,
+      requestId: req.id,
+    });
+
     // Create the incoming order
     const newIncomingOrder = await KapoorIncomingOrder.create({
       coldStorageId: storeAdminId,
@@ -361,19 +484,21 @@ const createIncomingOrder = async (req, reply) => {
       variety: variety,
       voucher: {
         type: "RECEIPT",
-        voucherNumber: voucherNumber,
+        voucherNumber: receiptNumber,
       },
       incomingBagSizes: incomingBagSizes,
-      dateOfEntry: dateOfEntry,
+      dateOfEntry: formattedDate,
       remarks: remarks || "",
       createdBy: storeAdminId,
+      currentStockAtThatTime, // Add the calculated stock
     });
 
     req.log.info("Incoming order created successfully", {
       orderId: newIncomingOrder._id,
       storeAdminId: storeAdminId,
       farmerAccount: farmerAccount,
-      voucherNumber: voucherNumber,
+      voucherNumber: receiptNumber,
+      currentStockAtThatTime,
     });
 
     return reply.code(201).send({
@@ -388,6 +513,7 @@ const createIncomingOrder = async (req, reply) => {
         incomingBagSizes: newIncomingOrder.incomingBagSizes,
         dateOfEntry: newIncomingOrder.dateOfEntry,
         remarks: newIncomingOrder.remarks,
+        currentStockAtThatTime: newIncomingOrder.currentStockAtThatTime,
         createdAt: newIncomingOrder.createdAt,
       },
     });
@@ -439,9 +565,10 @@ const getReceiptVoucherNumbers = async (req, reply) => {
   }
 };
 
-const getKapoorIncomingOrders = async (req, reply) => {
+const getKapoorDaybookOrders = async (req, reply) => {
   try {
     const coldStorageId = req.storeAdmin._id;
+    const { type } = req.query;
     const { sortBy } = req.query;
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 10;
@@ -453,6 +580,14 @@ const getKapoorIncomingOrders = async (req, reply) => {
     const sortOrderDetails = (orders) => {
       return orders.map((order) => {
         const orderObj = order.toObject();
+        if (orderObj.orderDetails) {
+          orderObj.orderDetails = orderObj.orderDetails.map((detail) => ({
+            ...detail,
+            outgoingBagSizes: detail.outgoingBagSizes.sort((a, b) =>
+              a.size.localeCompare(b.size)
+            ),
+          }));
+        }
         if (orderObj.incomingBagSizes) {
           orderObj.incomingBagSizes = orderObj.incomingBagSizes.sort((a, b) =>
             a.size.localeCompare(b.size)
@@ -477,59 +612,294 @@ const getKapoorIncomingOrders = async (req, reply) => {
       };
     };
 
-    req.log.info("Getting kapoor incoming orders", {
+    req.log.info("Getting kapoor daybook orders", {
       coldStorageId,
+      type,
       sortBy,
       page,
       limit,
       sortOrder
     });
 
-    // Get total count for pagination
-    const totalCount = await KapoorIncomingOrder.countDocuments({ coldStorageId });
+    switch (type) {
+      case "all": {
+        // Get total counts for pagination
+        const [incomingCount, outgoingCount] = await Promise.all([
+          KapoorIncomingOrder.countDocuments({ coldStorageId }),
+          KapoorOutgoingOrder.countDocuments({ coldStorageId }),
+        ]);
 
-    if (totalCount === 0) {
-      req.log.info("No incoming orders found for the cold storage");
-      return reply.code(200).send({
-        status: "Fail",
-        message: "No incoming orders found.",
-        pagination: createPaginationMeta(0, page, limit),
-      });
+        const totalCount = incomingCount + outgoingCount;
+
+        if (totalCount === 0) {
+          req.log.info("No orders found for the given cold storage.");
+          return reply.code(200).send({
+            status: "Fail",
+            message: "Cold storage doesn't have any orders",
+            pagination: createPaginationMeta(0, page, limit),
+          });
+        }
+
+        // For "all" type, we need to merge and sort both collections
+        // This is complex with pagination, so we'll fetch all and then paginate
+        // For better performance with large datasets, consider a different approach
+        const [allIncomingOrders, allOutgoingOrders] = await Promise.all([
+          KapoorIncomingOrder.find({ coldStorageId })
+            .sort({ createdAt: sortOrder })
+            .populate({
+              path: "farmerAccount",
+              model: FarmerAccount,
+              populate: {
+                path: "profile",
+                model: "FarmerProfile",
+                select: "name mobileNumber address"
+              },
+              select: "farmerId variety profile"
+            })
+            .select(
+              "_id coldStorageId remarks farmerAccount variety voucher incomingBagSizes dateOfEntry currentStockAtThatTime createdAt"
+            ),
+          KapoorOutgoingOrder.find({ coldStorageId })
+            .sort({ createdAt: sortOrder })
+            .populate({
+              path: "farmerAccount",
+              model: FarmerAccount,
+              populate: {
+                path: "profile",
+                model: "FarmerProfile",
+                select: "name mobileNumber address"
+              },
+              select: "farmerId variety profile"
+            })
+            .populate({
+              path: "orderDetails.incomingOrder",
+              model: KapoorIncomingOrder,
+              select: "voucher incomingBagSizes"
+            })
+            .select(
+              "_id coldStorageId remarks farmerAccount voucher dateOfExtraction orderDetails currentStockAtThatTime createdAt"
+            ),
+        ]);
+
+        // Merge and sort all orders by createdAt
+        const allOrders = [...allIncomingOrders, ...allOutgoingOrders];
+        allOrders.sort((a, b) => {
+          if (sortOrder === -1) {
+            return new Date(b.createdAt) - new Date(a.createdAt);
+          } else {
+            return new Date(a.createdAt) - new Date(b.createdAt);
+          }
+        });
+
+        // Apply pagination to merged results
+        const paginatedOrders = allOrders.slice(skip, skip + limit);
+        const sortedOrders = sortOrderDetails(paginatedOrders);
+
+                // Transform outgoing orders to match the desired format
+        const transformedOrders = sortedOrders.map(order => {
+          // Handle both Mongoose documents and plain objects
+          const orderObj = typeof order.toObject === 'function' ? order.toObject() : order;
+
+          // Only transform outgoing orders, keep incoming orders as is
+          if (orderObj.orderDetails) {
+            return {
+              voucher: orderObj.voucher,
+              _id: orderObj._id,
+              coldStorageId: orderObj.coldStorageId,
+              farmerId: {
+                _id: orderObj.farmerAccount._id,
+                name: orderObj.farmerAccount.profile.name,
+                farmerId: orderObj.farmerAccount.farmerId
+              },
+              dateOfExtraction: orderObj.dateOfExtraction,
+              remarks: orderObj.remarks,
+              currentStockAtThatTime: orderObj.currentStockAtThatTime,
+              orderDetails: orderObj.orderDetails.map(detail => ({
+                incomingOrder: {
+                  voucher: detail.incomingOrder.voucher,
+                  _id: detail.incomingOrder._id,
+                  location: detail.incomingOrder.incomingBagSizes[0]?.location || "N/A",
+                  incomingBagSizes: detail.incomingOrder.incomingBagSizes.map(bag => ({
+                    size: bag.size,
+                    currentQuantity: bag.quantity,
+                    initialQuantity: bag.quantity, // For now, keeping same as current
+                    _id: bag._id
+                  }))
+                },
+                variety: detail.variety,
+                bagSizes: detail.bagSizes.map(bag => ({
+                  size: bag.size,
+                  quantityRemoved: bag.quantityRemoved
+                }))
+              })),
+              createdAt: orderObj.createdAt
+            };
+          }
+          return orderObj; // Return incoming orders as is
+        });
+
+        // Log success and send response
+        req.log.info("All kapoor orders retrieved successfully.");
+        reply.code(200).send({
+          status: "Success",
+          data: transformedOrders,
+          pagination: createPaginationMeta(totalCount, page, limit),
+        });
+        break;
+      }
+      case "incoming": {
+        // Get total count for pagination
+        const totalCount = await KapoorIncomingOrder.countDocuments({ coldStorageId });
+
+        if (totalCount === 0) {
+          return reply.code(200).send({
+            status: "Fail",
+            message: "No incoming orders found.",
+            pagination: createPaginationMeta(0, page, limit),
+          });
+        }
+
+        const incomingOrders = await KapoorIncomingOrder.find({ coldStorageId })
+          .skip(skip)
+          .limit(limit)
+          .sort({ createdAt: sortOrder })
+          .populate({
+            path: "farmerAccount",
+            model: FarmerAccount,
+            populate: {
+              path: "profile",
+              model: "FarmerProfile",
+              select: "name mobileNumber address"
+            },
+            select: "farmerId variety profile"
+          })
+          .select(
+            "_id coldStorageId remarks farmerAccount variety voucher incomingBagSizes dateOfEntry currentStockAtThatTime createdAt"
+          );
+
+        const sortedOrders = sortOrderDetails(incomingOrders);
+
+        // Transform incoming orders to match the desired format
+        const transformedOrders = sortedOrders.map(order => {
+          // Handle both Mongoose documents and plain objects
+          const orderObj = typeof order.toObject === 'function' ? order.toObject() : order;
+          return {
+            voucher: orderObj.voucher,
+            _id: orderObj._id,
+            coldStorageId: orderObj.coldStorageId,
+            farmerId: {
+              _id: orderObj.farmerAccount._id,
+              name: orderObj.farmerAccount.profile.name,
+              farmerId: orderObj.farmerAccount.farmerId
+            },
+            dateOfEntry: orderObj.dateOfEntry,
+            remarks: orderObj.remarks,
+            currentStockAtThatTime: orderObj.currentStockAtThatTime,
+            incomingBagSizes: orderObj.incomingBagSizes,
+            variety: orderObj.variety,
+            createdAt: orderObj.createdAt
+          };
+        });
+
+        reply.code(200).send({
+          status: "Success",
+          data: transformedOrders,
+          pagination: createPaginationMeta(totalCount, page, limit),
+        });
+        break;
+      }
+      case "outgoing": {
+        // Get total count for pagination
+        const totalCount = await KapoorOutgoingOrder.countDocuments({ coldStorageId });
+
+        if (totalCount === 0) {
+          return reply.code(200).send({
+            status: "Fail",
+            message: "No outgoing orders found.",
+            pagination: createPaginationMeta(0, page, limit),
+          });
+        }
+
+        const outgoingOrders = await KapoorOutgoingOrder.find({ coldStorageId })
+          .skip(skip)
+          .limit(limit)
+          .sort({ createdAt: sortOrder })
+          .populate({
+            path: "farmerAccount",
+            model: FarmerAccount,
+            populate: {
+              path: "profile",
+              model: "FarmerProfile",
+              select: "name mobileNumber address"
+            },
+            select: "farmerId variety profile"
+          })
+          .populate({
+            path: "orderDetails.incomingOrder",
+            model: KapoorIncomingOrder,
+            select: "voucher incomingBagSizes"
+          })
+          .select(
+            "_id coldStorageId remarks farmerAccount voucher dateOfExtraction orderDetails currentStockAtThatTime createdAt"
+          );
+
+        const sortedOrders = sortOrderDetails(outgoingOrders);
+
+        // Transform the data to match the desired format
+        const transformedOrders = sortedOrders.map(order => {
+          // Handle both Mongoose documents and plain objects
+          const orderObj = typeof order.toObject === 'function' ? order.toObject() : order;
+          return {
+            voucher: orderObj.voucher,
+            _id: orderObj._id,
+            coldStorageId: orderObj.coldStorageId,
+            farmerId: {
+              _id: orderObj.farmerAccount._id,
+              name: orderObj.farmerAccount.profile.name,
+              farmerId: orderObj.farmerAccount.farmerId
+            },
+            dateOfExtraction: orderObj.dateOfExtraction,
+            remarks: orderObj.remarks,
+            currentStockAtThatTime: orderObj.currentStockAtThatTime,
+            orderDetails: orderObj.orderDetails.map(detail => ({
+              incomingOrder: {
+                voucher: detail.incomingOrder.voucher,
+                _id: detail.incomingOrder._id,
+                location: detail.incomingOrder.incomingBagSizes[0]?.location || "N/A",
+                incomingBagSizes: detail.incomingOrder.incomingBagSizes.map(bag => ({
+                  size: bag.size,
+                  currentQuantity: bag.quantity,
+                  initialQuantity: bag.quantity, // For now, keeping same as current
+                  _id: bag._id
+                }))
+              },
+              variety: detail.variety,
+              bagSizes: detail.bagSizes.map(bag => ({
+                size: bag.size,
+                quantityRemoved: bag.quantityRemoved
+              }))
+            })),
+            createdAt: orderObj.createdAt
+          };
+        });
+
+        reply.code(200).send({
+          status: "Success",
+          data: transformedOrders,
+          pagination: createPaginationMeta(totalCount, page, limit),
+        });
+        break;
+      }
+      default: {
+        reply.code(400).send({
+          message: "Invalid type parameter. Use 'all', 'incoming', or 'outgoing'.",
+        });
+        break;
+      }
     }
 
-    const incomingOrders = await KapoorIncomingOrder.find({ coldStorageId })
-      .skip(skip)
-      .limit(limit)
-      .sort({ createdAt: sortOrder })
-      .populate({
-        path: "farmerAccount",
-        model: FarmerAccount,
-        populate: {
-          path: "profile",
-          model: "FarmerProfile",
-          select: "name mobileNumber address"
-        },
-        select: "farmerId variety profile"
-      })
-      .select(
-        "_id coldStorageId remarks farmerAccount variety voucher incomingBagSizes dateOfEntry createdAt"
-      );
-
-    const sortedOrders = sortOrderDetails(incomingOrders);
-
-    req.log.info("Kapoor incoming orders retrieved successfully", {
-      count: sortedOrders.length,
-      totalCount
-    });
-
-    reply.code(200).send({
-      status: "Success",
-      data: sortedOrders,
-      pagination: createPaginationMeta(totalCount, page, limit),
-    });
-
   } catch (err) {
-    req.log.error("Error getting kapoor incoming orders:", {
+    req.log.error("Error getting kapoor daybook orders:", {
       error: err.message,
     });
 
@@ -570,7 +940,7 @@ const getAllIncomingOrdersOfASingleFarmer = async (req, reply) => {
         select: "farmerId variety profile"
       })
       .select(
-        "_id coldStorageId remarks farmerAccount variety voucher incomingBagSizes dateOfEntry createdAt"
+        "_id coldStorageId remarks farmerAccount variety voucher incomingBagSizes dateOfEntry currentStockAtThatTime createdAt"
       )
       .sort({ createdAt: -1 });
 
@@ -591,4 +961,6 @@ const getAllIncomingOrdersOfASingleFarmer = async (req, reply) => {
   }
 };
 
-export { quickRegisterFarmer, getFarmersIdsForCheck, getAllFarmerProfiles, getAccountsForFarmerProfile, searchFarmerProfiles, createIncomingOrder, getReceiptVoucherNumbers, getKapoorIncomingOrders, getAllIncomingOrdersOfASingleFarmer };
+
+
+export { quickRegisterFarmer, getFarmersIdsForCheck, getAllFarmerProfiles, getAccountsForFarmerProfile, searchFarmerProfiles, createIncomingOrder, getReceiptVoucherNumbers, getKapoorDaybookOrders, getAllIncomingOrdersOfASingleFarmer, createKapoorOutgoingOrder };
