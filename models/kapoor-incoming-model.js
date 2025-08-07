@@ -10,10 +10,16 @@ const incomingBagSizeSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
-    quantity: {
-      type: Number,
-      required: true,
-    },
+   quantity: {
+        initialQuantity: {
+          type: Number,
+          required: true,
+        },
+        currentQuantity: {
+          type: Number,
+          required: true,
+        },
+      },
     location: {
       type: String,
       required: true,
@@ -62,6 +68,10 @@ const kapoorIncomingOrderSchema = new mongoose.Schema(
 
     remarks: {
       type: String,
+    },
+      currentStockAtThatTime: {
+      type: Number,
+      required: true,
     },
 
     createdBy: {

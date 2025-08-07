@@ -1,3 +1,4 @@
+import KapoorIncomingOrder from "../models/kapoor-incoming-model.js";
 import KapoorOutgoingOrder from "../models/kapoor-outgoing-order-model.js";
 import Order from "../models/orderModel.js";
 import OutgoingOrder from "../models/outgoingOrderModel.js";
@@ -46,7 +47,7 @@ const addOrdinalSuffix = (day) => {
 
 export const getReceiptNumberHelper = async (storeAdminId) => {
   try {
-    const result = await Order.aggregate([
+    const result = await KapoorIncomingOrder.aggregate([
       {
         $match: {
           coldStorageId: new mongoose.Types.ObjectId(storeAdminId),

@@ -12,7 +12,7 @@ import StoreAdmin from "../models/storeAdminModel.js";
 import KapoorIncomingOrder from "../models/kapoor-incoming-model.js";
 import KapoorOutgoingOrder from "../models/kapoor-outgoing-order-model.js";
 import mongoose from "mongoose";
-import { getDeliveryVoucherNumberHelper, formatDate, formatFarmerName } from "../utils/helpers.js";
+import { getDeliveryVoucherNumberHelper, getReceiptNumberHelper,formatDate, formatFarmerName } from "../utils/helpers.js";
 
 // Helper function to calculate current stock for KapoorIncomingOrder
 const getCurrentStockForKapoor = async (coldStorageId, req) => {
@@ -39,7 +39,7 @@ const getCurrentStockForKapoor = async (coldStorageId, req) => {
         $group: {
           _id: null,
           totalCurrentQuantity: {
-            $sum: "$incomingBagSizes.quantity",
+            $sum: "$incomingBagSizes.quantity.currentQuantity",
           },
         },
       },
@@ -338,7 +338,6 @@ const createIncomingOrder = async (req, reply) => {
       remarks,
     } = req.body;
 
-    // Validate required fields
     if (!farmerAccount || !variety || !incomingBagSizes) {
       return reply.code(400).send({
         status: "Fail",
@@ -346,7 +345,6 @@ const createIncomingOrder = async (req, reply) => {
       });
     }
 
-    // Format current date to DD.MM.YY
     const formattedDate = new Date()
       .toLocaleDateString("en-GB", {
         day: "2-digit",
@@ -356,8 +354,7 @@ const createIncomingOrder = async (req, reply) => {
       .split("/")
       .join(".");
 
-    // Get receipt number
-    const receiptNumber = await getKapoorReceiptNumberHelper(storeAdminId);
+    const receiptNumber = await getReceiptNumberHelper(storeAdminId);
 
     if (!receiptNumber) {
       return reply.code(500).send({
@@ -366,7 +363,6 @@ const createIncomingOrder = async (req, reply) => {
       });
     }
 
-    // Validate incomingBagSizes structure
     if (!Array.isArray(incomingBagSizes) || incomingBagSizes.length === 0) {
       return reply.code(400).send({
         status: "Fail",
@@ -374,24 +370,26 @@ const createIncomingOrder = async (req, reply) => {
       });
     }
 
-    // Validate each bag size object
     for (const bagSize of incomingBagSizes) {
-      if (!bagSize.size || !bagSize.quantity || !bagSize.location) {
+      if (
+        !bagSize.size ||
+        !bagSize.quantity ||
+        typeof bagSize.quantity !== "object" ||
+        bagSize.quantity.initialQuantity == null ||
+        bagSize.quantity.currentQuantity == null ||
+        typeof bagSize.quantity.initialQuantity !== "number" ||
+        typeof bagSize.quantity.currentQuantity !== "number" ||
+        bagSize.quantity.initialQuantity < 0 ||
+        bagSize.quantity.currentQuantity < 0 ||
+        !bagSize.location
+      ) {
         return reply.code(400).send({
           status: "Fail",
-          message: "Each bag size must have size, quantity, and location fields",
-        });
-      }
-
-      if (typeof bagSize.quantity !== 'number' || bagSize.quantity <= 0) {
-        return reply.code(400).send({
-          status: "Fail",
-          message: "Quantity must be a positive number",
+          message: "Each bag size must have size, quantity (with initial and current), and location",
         });
       }
     }
 
-    // Check if farmer account exists and belongs to this store admin
     const farmerAccountDoc = await FarmerAccount.findOne({
       _id: farmerAccount,
       storeAdmin: storeAdminId,
@@ -404,7 +402,6 @@ const createIncomingOrder = async (req, reply) => {
       });
     }
 
-    // Check if voucher number already exists for this store
     const existingOrder = await KapoorIncomingOrder.findOne({
       coldStorageId: storeAdminId,
       "voucher.voucherNumber": receiptNumber,
@@ -417,7 +414,6 @@ const createIncomingOrder = async (req, reply) => {
       });
     }
 
-    // Calculate the existing stock
     let existingStock;
     try {
       existingStock = await getCurrentStockForKapoor(storeAdminId, req);
@@ -440,11 +436,10 @@ const createIncomingOrder = async (req, reply) => {
       });
     }
 
-    // Calculate additional stock from the current order
     let additionalStock = 0;
     try {
       additionalStock = incomingBagSizes.reduce(
-        (sum, bag) => sum + (bag.quantity || 0),
+        (sum, bag) => sum + (bag.quantity.currentQuantity || 0),
         0
       );
 
@@ -466,7 +461,6 @@ const createIncomingOrder = async (req, reply) => {
       });
     }
 
-    // Combine existing stock with the new order's stock
     const currentStockAtThatTime = existingStock + additionalStock;
 
     req.log.info("Final current stock calculation", {
@@ -477,26 +471,25 @@ const createIncomingOrder = async (req, reply) => {
       requestId: req.id,
     });
 
-    // Create the incoming order
     const newIncomingOrder = await KapoorIncomingOrder.create({
       coldStorageId: storeAdminId,
-      farmerAccount: farmerAccount,
-      variety: variety,
+      farmerAccount,
+      variety,
       voucher: {
         type: "RECEIPT",
         voucherNumber: receiptNumber,
       },
-      incomingBagSizes: incomingBagSizes,
+      incomingBagSizes,
       dateOfEntry: formattedDate,
       remarks: remarks || "",
       createdBy: storeAdminId,
-      currentStockAtThatTime, // Add the calculated stock
+      currentStockAtThatTime,
     });
 
     req.log.info("Incoming order created successfully", {
       orderId: newIncomingOrder._id,
-      storeAdminId: storeAdminId,
-      farmerAccount: farmerAccount,
+      storeAdminId,
+      farmerAccount,
       voucherNumber: receiptNumber,
       currentStockAtThatTime,
     });
@@ -530,6 +523,7 @@ const createIncomingOrder = async (req, reply) => {
     });
   }
 };
+
 
 const getReceiptVoucherNumbers = async (req, reply) => {
   try {
@@ -568,24 +562,21 @@ const getReceiptVoucherNumbers = async (req, reply) => {
 const getKapoorDaybookOrders = async (req, reply) => {
   try {
     const coldStorageId = req.storeAdmin._id;
-    const { type } = req.query;
-    const { sortBy } = req.query;
+    const { type, sortBy } = req.query;
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 10;
     const sortOrder = sortBy === "latest" ? -1 : 1;
-
     const skip = (page - 1) * limit;
 
-    // Helper function to sort bag sizes
     const sortOrderDetails = (orders) => {
       return orders.map((order) => {
-        const orderObj = order.toObject();
+        const orderObj = order.toObject ? order.toObject() : order;
         if (orderObj.orderDetails) {
           orderObj.orderDetails = orderObj.orderDetails.map((detail) => ({
             ...detail,
-            outgoingBagSizes: detail.outgoingBagSizes.sort((a, b) =>
-              a.size.localeCompare(b.size)
-            ),
+            bagSizes:
+              detail.bagSizes?.sort((a, b) => a.size.localeCompare(b.size)) ||
+              [],
           }));
         }
         if (orderObj.incomingBagSizes) {
@@ -597,7 +588,6 @@ const getKapoorDaybookOrders = async (req, reply) => {
       });
     };
 
-    // Helper function to create pagination metadata
     const createPaginationMeta = (total, page, limit) => {
       const totalPages = Math.ceil(total / limit);
       return {
@@ -618,12 +608,11 @@ const getKapoorDaybookOrders = async (req, reply) => {
       sortBy,
       page,
       limit,
-      sortOrder
+      sortOrder,
     });
 
     switch (type) {
       case "all": {
-        // Get total counts for pagination
         const [incomingCount, outgoingCount] = await Promise.all([
           KapoorIncomingOrder.countDocuments({ coldStorageId }),
           KapoorOutgoingOrder.countDocuments({ coldStorageId }),
@@ -632,7 +621,6 @@ const getKapoorDaybookOrders = async (req, reply) => {
         const totalCount = incomingCount + outgoingCount;
 
         if (totalCount === 0) {
-          req.log.info("No orders found for the given cold storage.");
           return reply.code(200).send({
             status: "Fail",
             message: "Cold storage doesn't have any orders",
@@ -640,9 +628,6 @@ const getKapoorDaybookOrders = async (req, reply) => {
           });
         }
 
-        // For "all" type, we need to merge and sort both collections
-        // This is complex with pagination, so we'll fetch all and then paginate
-        // For better performance with large datasets, consider a different approach
         const [allIncomingOrders, allOutgoingOrders] = await Promise.all([
           KapoorIncomingOrder.find({ coldStorageId })
             .sort({ createdAt: sortOrder })
@@ -652,13 +637,14 @@ const getKapoorDaybookOrders = async (req, reply) => {
               populate: {
                 path: "profile",
                 model: "FarmerProfile",
-                select: "name mobileNumber address"
+                select: "name mobileNumber address",
               },
-              select: "farmerId variety profile"
+              select: "farmerId variety profile",
             })
             .select(
               "_id coldStorageId remarks farmerAccount variety voucher incomingBagSizes dateOfEntry currentStockAtThatTime createdAt"
             ),
+
           KapoorOutgoingOrder.find({ coldStorageId })
             .sort({ createdAt: sortOrder })
             .populate({
@@ -667,79 +653,107 @@ const getKapoorDaybookOrders = async (req, reply) => {
               populate: {
                 path: "profile",
                 model: "FarmerProfile",
-                select: "name mobileNumber address"
+                select: "name mobileNumber address",
               },
-              select: "farmerId variety profile"
+              select: "farmerId variety profile",
             })
             .populate({
-              path: "orderDetails.incomingOrder",
+              path: "orderDetails.incomingOrder._id",
               model: KapoorIncomingOrder,
-              select: "voucher incomingBagSizes"
+              select: "voucher incomingBagSizes",
             })
             .select(
               "_id coldStorageId remarks farmerAccount voucher dateOfExtraction orderDetails currentStockAtThatTime createdAt"
             ),
         ]);
 
-        // Merge and sort all orders by createdAt
         const allOrders = [...allIncomingOrders, ...allOutgoingOrders];
-        allOrders.sort((a, b) => {
-          if (sortOrder === -1) {
-            return new Date(b.createdAt) - new Date(a.createdAt);
-          } else {
-            return new Date(a.createdAt) - new Date(b.createdAt);
-          }
-        });
-
-        // Apply pagination to merged results
+        allOrders.sort((a, b) =>
+          sortOrder === -1
+            ? new Date(b.createdAt) - new Date(a.createdAt)
+            : new Date(a.createdAt) - new Date(b.createdAt)
+        );
         const paginatedOrders = allOrders.slice(skip, skip + limit);
         const sortedOrders = sortOrderDetails(paginatedOrders);
 
-                // Transform outgoing orders to match the desired format
-        const transformedOrders = sortedOrders.map(order => {
-          // Handle both Mongoose documents and plain objects
-          const orderObj = typeof order.toObject === 'function' ? order.toObject() : order;
+        const transformedOrders = sortedOrders.map((order) => {
+          const o = order.toObject ? order.toObject() : order;
+          const fa = o.farmerAccount;
+          const profile = fa?.profile || {};
+          const baseAccount = {
+            _id: fa._id,
+            name: profile.name || "",
+            address: profile.address || "",
+            mobileNumber: profile.mobileNumber || "",
+            farmerId: fa.farmerId,
+          };
 
-          // Only transform outgoing orders, keep incoming orders as is
-          if (orderObj.orderDetails) {
+          if (o.orderDetails) {
             return {
-              voucher: orderObj.voucher,
-              _id: orderObj._id,
-              coldStorageId: orderObj.coldStorageId,
-              farmerId: {
-                _id: orderObj.farmerAccount._id,
-                name: orderObj.farmerAccount.profile.name,
-                farmerId: orderObj.farmerAccount.farmerId
-              },
-              dateOfExtraction: orderObj.dateOfExtraction,
-              remarks: orderObj.remarks,
-              currentStockAtThatTime: orderObj.currentStockAtThatTime,
-              orderDetails: orderObj.orderDetails.map(detail => ({
-                incomingOrder: {
-                  voucher: detail.incomingOrder.voucher,
-                  _id: detail.incomingOrder._id,
-                  location: detail.incomingOrder.incomingBagSizes[0]?.location || "N/A",
-                  incomingBagSizes: detail.incomingOrder.incomingBagSizes.map(bag => ({
+              voucher: o.voucher,
+              _id: o._id,
+              coldStorageId: o.coldStorageId,
+              farmerAccount: baseAccount,
+              dateOfExtraction: o.dateOfExtraction,
+              remarks: o.remarks,
+              currentStockAtThatTime: o.currentStockAtThatTime,
+              orderDetails: o.orderDetails.map((detail) => {
+                const incomingDoc = detail.incomingOrder?._id?.voucher
+                  ? detail.incomingOrder._id
+                  : null;
+                const incomingOrder = incomingDoc
+                  ? {
+                      voucher: incomingDoc.voucher,
+                      _id: incomingDoc._id,
+                      incomingBagSizes: (
+                        incomingDoc.incomingBagSizes || []
+                      ).map((b) => ({
+                        size: b.size,
+                        quantity: b.quantity,
+                        location: b.location,
+                        _id: b._id,
+                      })),
+                    }
+                  : {
+                      voucher: detail.incomingOrder?.voucher,
+                      _id: detail.incomingOrder?._id,
+                      incomingBagSizes:
+                        detail.incomingOrder?.incomingBagSizes || [],
+                    };
+
+                return {
+                  incomingOrder,
+                  variety: detail.variety,
+                  bagSizes: (detail.bagSizes || []).map((bag) => ({
                     size: bag.size,
-                    currentQuantity: bag.quantity,
-                    initialQuantity: bag.quantity, // For now, keeping same as current
-                    _id: bag._id
-                  }))
-                },
-                variety: detail.variety,
-                bagSizes: detail.bagSizes.map(bag => ({
-                  size: bag.size,
-                  quantityRemoved: bag.quantityRemoved
-                }))
-              })),
-              createdAt: orderObj.createdAt
+                    quantityRemoved: bag.quantityRemoved,
+                    location: bag.location,
+                  })),
+                };
+              }),
+              createdAt: o.createdAt,
             };
           }
-          return orderObj; // Return incoming orders as is
+
+          return {
+            voucher: o.voucher,
+            _id: o._id,
+            coldStorageId: o.coldStorageId,
+            farmerAccount: baseAccount,
+            dateOfEntry: o.dateOfEntry,
+            remarks: o.remarks,
+            currentStockAtThatTime: o.currentStockAtThatTime,
+            incomingBagSizes: (o.incomingBagSizes || []).map((b) => ({
+              size: b.size,
+              quantity: b.quantity,
+              location: b.location,
+              _id: b._id,
+            })),
+            variety: o.variety,
+            createdAt: o.createdAt,
+          };
         });
 
-        // Log success and send response
-        req.log.info("All kapoor orders retrieved successfully.");
         reply.code(200).send({
           status: "Success",
           data: transformedOrders,
@@ -747,9 +761,11 @@ const getKapoorDaybookOrders = async (req, reply) => {
         });
         break;
       }
+
       case "incoming": {
-        // Get total count for pagination
-        const totalCount = await KapoorIncomingOrder.countDocuments({ coldStorageId });
+        const totalCount = await KapoorIncomingOrder.countDocuments({
+          coldStorageId,
+        });
 
         if (totalCount === 0) {
           return reply.code(200).send({
@@ -769,9 +785,9 @@ const getKapoorDaybookOrders = async (req, reply) => {
             populate: {
               path: "profile",
               model: "FarmerProfile",
-              select: "name mobileNumber address"
+              select: "name mobileNumber address",
             },
-            select: "farmerId variety profile"
+            select: "farmerId variety profile",
           })
           .select(
             "_id coldStorageId remarks farmerAccount variety voucher incomingBagSizes dateOfEntry currentStockAtThatTime createdAt"
@@ -779,25 +795,31 @@ const getKapoorDaybookOrders = async (req, reply) => {
 
         const sortedOrders = sortOrderDetails(incomingOrders);
 
-        // Transform incoming orders to match the desired format
-        const transformedOrders = sortedOrders.map(order => {
-          // Handle both Mongoose documents and plain objects
-          const orderObj = typeof order.toObject === 'function' ? order.toObject() : order;
+        const transformedOrders = sortedOrders.map((o) => {
+          const fa = o.farmerAccount;
+          const profile = fa?.profile || {};
           return {
-            voucher: orderObj.voucher,
-            _id: orderObj._id,
-            coldStorageId: orderObj.coldStorageId,
-            farmerId: {
-              _id: orderObj.farmerAccount._id,
-              name: orderObj.farmerAccount.profile.name,
-              farmerId: orderObj.farmerAccount.farmerId
+            voucher: o.voucher,
+            _id: o._id,
+            coldStorageId: o.coldStorageId,
+            farmerAccount: {
+              _id: fa._id,
+              name: profile.name || "",
+              address: profile.address || "",
+              mobileNumber: profile.mobileNumber || "",
+              farmerId: fa.farmerId,
             },
-            dateOfEntry: orderObj.dateOfEntry,
-            remarks: orderObj.remarks,
-            currentStockAtThatTime: orderObj.currentStockAtThatTime,
-            incomingBagSizes: orderObj.incomingBagSizes,
-            variety: orderObj.variety,
-            createdAt: orderObj.createdAt
+            dateOfEntry: o.dateOfEntry,
+            remarks: o.remarks,
+            currentStockAtThatTime: o.currentStockAtThatTime,
+            incomingBagSizes: (o.incomingBagSizes || []).map((b) => ({
+              size: b.size,
+              quantity: b.quantity,
+              location: b.location,
+              _id: b._id,
+            })),
+            variety: o.variety,
+            createdAt: o.createdAt,
           };
         });
 
@@ -808,9 +830,11 @@ const getKapoorDaybookOrders = async (req, reply) => {
         });
         break;
       }
+
       case "outgoing": {
-        // Get total count for pagination
-        const totalCount = await KapoorOutgoingOrder.countDocuments({ coldStorageId });
+        const totalCount = await KapoorOutgoingOrder.countDocuments({
+          coldStorageId,
+        });
 
         if (totalCount === 0) {
           return reply.code(200).send({
@@ -830,14 +854,14 @@ const getKapoorDaybookOrders = async (req, reply) => {
             populate: {
               path: "profile",
               model: "FarmerProfile",
-              select: "name mobileNumber address"
+              select: "name mobileNumber address",
             },
-            select: "farmerId variety profile"
+            select: "farmerId variety profile",
           })
           .populate({
-            path: "orderDetails.incomingOrder",
+            path: "orderDetails.incomingOrder._id",
             model: KapoorIncomingOrder,
-            select: "voucher incomingBagSizes"
+            select: "voucher incomingBagSizes",
           })
           .select(
             "_id coldStorageId remarks farmerAccount voucher dateOfExtraction orderDetails currentStockAtThatTime createdAt"
@@ -845,41 +869,57 @@ const getKapoorDaybookOrders = async (req, reply) => {
 
         const sortedOrders = sortOrderDetails(outgoingOrders);
 
-        // Transform the data to match the desired format
-        const transformedOrders = sortedOrders.map(order => {
-          // Handle both Mongoose documents and plain objects
-          const orderObj = typeof order.toObject === 'function' ? order.toObject() : order;
+        const transformedOrders = sortedOrders.map((o) => {
+          const fa = o.farmerAccount;
+          const profile = fa?.profile || {};
           return {
-            voucher: orderObj.voucher,
-            _id: orderObj._id,
-            coldStorageId: orderObj.coldStorageId,
-            farmerId: {
-              _id: orderObj.farmerAccount._id,
-              name: orderObj.farmerAccount.profile.name,
-              farmerId: orderObj.farmerAccount.farmerId
+            voucher: o.voucher,
+            _id: o._id,
+            coldStorageId: o.coldStorageId,
+            farmerAccount: {
+              _id: fa._id,
+              name: profile.name || "",
+              address: profile.address || "",
+              mobileNumber: profile.mobileNumber || "",
+              farmerId: fa.farmerId,
             },
-            dateOfExtraction: orderObj.dateOfExtraction,
-            remarks: orderObj.remarks,
-            currentStockAtThatTime: orderObj.currentStockAtThatTime,
-            orderDetails: orderObj.orderDetails.map(detail => ({
-              incomingOrder: {
-                voucher: detail.incomingOrder.voucher,
-                _id: detail.incomingOrder._id,
-                location: detail.incomingOrder.incomingBagSizes[0]?.location || "N/A",
-                incomingBagSizes: detail.incomingOrder.incomingBagSizes.map(bag => ({
+            dateOfExtraction: o.dateOfExtraction,
+            remarks: o.remarks,
+            currentStockAtThatTime: o.currentStockAtThatTime,
+            orderDetails: o.orderDetails.map((detail) => {
+              const incomingDoc = detail.incomingOrder?._id?.voucher
+                ? detail.incomingOrder._id
+                : null;
+              const incomingOrder = incomingDoc
+                ? {
+                    voucher: incomingDoc.voucher,
+                    _id: incomingDoc._id,
+                    incomingBagSizes: (incomingDoc.incomingBagSizes || []).map(
+                      (b) => ({
+                        size: b.size,
+                        quantity: b.quantity,
+                        location: b.location,
+                        _id: b._id,
+                      })
+                    ),
+                  }
+                : {
+                    voucher: detail.incomingOrder?.voucher,
+                    _id: detail.incomingOrder?._id,
+                    incomingBagSizes:
+                      detail.incomingOrder?.incomingBagSizes || [],
+                  };
+              return {
+                incomingOrder,
+                variety: detail.variety,
+                bagSizes: (detail.bagSizes || []).map((bag) => ({
                   size: bag.size,
-                  currentQuantity: bag.quantity,
-                  initialQuantity: bag.quantity, // For now, keeping same as current
-                  _id: bag._id
-                }))
-              },
-              variety: detail.variety,
-              bagSizes: detail.bagSizes.map(bag => ({
-                size: bag.size,
-                quantityRemoved: bag.quantityRemoved
-              }))
-            })),
-            createdAt: orderObj.createdAt
+                  quantityRemoved: bag.quantityRemoved,
+                  location: bag.location,
+                })),
+              };
+            }),
+            createdAt: o.createdAt,
           };
         });
 
@@ -890,14 +930,15 @@ const getKapoorDaybookOrders = async (req, reply) => {
         });
         break;
       }
+
       default: {
         reply.code(400).send({
-          message: "Invalid type parameter. Use 'all', 'incoming', or 'outgoing'.",
+          message:
+            "Invalid type parameter. Use 'all', 'incoming', or 'outgoing'.",
         });
         break;
       }
     }
-
   } catch (err) {
     req.log.error("Error getting kapoor daybook orders:", {
       error: err.message,
@@ -910,6 +951,7 @@ const getKapoorDaybookOrders = async (req, reply) => {
     });
   }
 };
+
 
 /**
  * Get all incoming orders for a single farmer (by FarmerAccount IDs)
@@ -962,42 +1004,191 @@ const getAllIncomingOrdersOfASingleFarmer = async (req, reply) => {
 };
 
 
-// Modified createOutgoingOrder controller for Kapoor model structure
 const createOutgoingOrder = async (req, reply) => {
   const session = await mongoose.startSession();
   session.startTransaction();
 
   try {
+    req.log.info("Starting createOutgoingOrder process", {
+      storeAdminId: req.storeAdmin._id,
+      farmerId: req.params.id,
+      body: req.body,
+    });
+
     const { orders, remarks } = req.body;
     const { id } = req.params;
 
+    console.log("orders is: ", orders);
+
+    // Validate orders array
     if (!Array.isArray(orders) || orders.length === 0) {
+      req.log.warn("Invalid orders array provided", {
+        isArray: Array.isArray(orders),
+        length: orders?.length,
+      });
       throw new Error("Orders array is required and cannot be empty");
     }
 
+    req.log.info("Validating order structure", { orderCount: orders.length });
+
+    // Validate each order's structure
+    orders.forEach((order, index) => {
+      req.log.info("Validating order", {
+        orderIndex: index,
+        orderId: order.orderId,
+        variety: order.variety,
+        bagUpdatesCount: order.bagUpdates?.length,
+      });
+
+      if (
+        !order.orderId ||
+        !order.variety ||
+        !Array.isArray(order.bagUpdates)
+      ) {
+        req.log.warn("Invalid order structure detected", {
+          orderIndex: index,
+          hasOrderId: !!order.orderId,
+          hasVariety: !!order.variety,
+          hasBagUpdates: Array.isArray(order.bagUpdates),
+        });
+        throw new Error(
+          "Invalid order structure. Required fields: orderId, variety, bagUpdates"
+        );
+      }
+
+      // Validate bagUpdates
+      order.bagUpdates.forEach((update, bagIndex) => {
+        req.log.info("Validating bag update", {
+          orderIndex: index,
+          bagIndex,
+          size: update.size,
+          location: update.location,
+          quantityToRemove: update.quantityToRemove,
+        });
+
+        if (!update.size || !update.location || typeof update.quantityToRemove !== "number") {
+          req.log.warn("Invalid bag update structure", {
+            orderIndex: index,
+            bagIndex,
+            hasSize: !!update.size,
+            hasLocation: !!update.location,
+            quantityType: typeof update.quantityToRemove,
+          });
+          throw new Error(
+            "Invalid bag update structure. Required fields: size, location, quantityToRemove"
+          );
+        }
+
+        // Check for negative quantities
+        if (update.quantityToRemove < 0) {
+          req.log.warn("Negative quantity to remove detected", {
+            orderIndex: index,
+            bagIndex,
+            quantityToRemove: update.quantityToRemove,
+          });
+          throw new Error(
+            `Invalid quantity to remove: ${update.quantityToRemove}. Must be greater than or equal to 0`
+          );
+        }
+      });
+    });
+
+    req.log.info("Starting to fetch and validate incoming orders");
+
     // Fetch incoming orders to validate and build map
     const incomingOrders = await Promise.all(
-      orders.map(async ({ orderId, variety, bagUpdates }) => {
+      orders.map(async (order, index) => {
+        const { orderId, variety, bagUpdates } = order;
+
+        req.log.info("Fetching order details", {
+          orderIndex: index,
+          orderId,
+          variety,
+        });
+
         const fetchedOrder = await KapoorIncomingOrder.findById(orderId).lean();
-        if (!fetchedOrder) throw new Error(`Order ${orderId} not found`);
+        if (!fetchedOrder) {
+          req.log.warn("Order not found", {
+            orderIndex: index,
+            orderId,
+          });
+          throw new Error(`Order with ID ${orderId} not found`);
+        }
 
         // Model does not have orderDetails, so use variety and incomingBagSizes
         if (fetchedOrder.variety !== variety) {
+          req.log.warn("Variety not found in order", {
+            orderIndex: index,
+            orderId,
+            variety,
+            fetchedVariety: fetchedOrder.variety,
+          });
           throw new Error(`Variety ${variety} not found in order ${orderId}`);
         }
+
         const matchingDetail = {
           variety: fetchedOrder.variety,
           bagSizes: fetchedOrder.incomingBagSizes,
         };
 
-        bagUpdates.forEach(({ size, location, quantityToRemove }) => {
-          const match = matchingDetail.bagSizes.find(
-            (b) => b.size === size && b.location === location
+        req.log.info("Validating quantities for bag updates", {
+          orderIndex: index,
+          orderId,
+          variety,
+          bagUpdatesCount: bagUpdates.length,
+        });
+
+        // Validate quantities for each bag update
+        bagUpdates.forEach((update, bagIndex) => {
+          const { size, location, quantityToRemove } = update;
+          
+          const matchingBag = matchingDetail.bagSizes.find(
+            (bag) => bag.size === size && bag.location === location
           );
-          if (!match) throw new Error(`Size ${size} at ${location} not found`);
-          if (match.quantity < quantityToRemove) {
-            throw new Error(`Insufficient stock for ${variety} ${size} at ${location}`);
+
+          if (!matchingBag) {
+            req.log.warn("Bag size/location not found", {
+              orderIndex: index,
+              bagIndex,
+              size: size,
+              location: location,
+              availableBags: matchingDetail.bagSizes.map((b) => ({ size: b.size, location: b.location })),
+            });
+            throw new Error(
+              `Bag size ${size} at location ${location} not found for variety ${variety} in order ${orderId}`
+            );
           }
+
+          req.log.info("Checking quantity availability", {
+            orderIndex: index,
+            bagIndex,
+            size: size,
+            location: location,
+            requested: quantityToRemove,
+            available: matchingBag.quantity.currentQuantity, // 🔧 FIXED: Access currentQuantity
+          });
+
+          if (matchingBag.quantity.currentQuantity < quantityToRemove) {
+            req.log.warn("Insufficient quantity available", {
+              orderIndex: index,
+              bagIndex,
+              variety,
+              size: size,
+              location: location,
+              requested: quantityToRemove,
+              available: matchingBag.quantity.currentQuantity, // 🔧 FIXED: Access currentQuantity
+            });
+            throw new Error(
+              `Insufficient quantity available for ${variety} size ${size} at ${location}. ` +
+                `Requested: ${quantityToRemove}, Available: ${matchingBag.quantity.currentQuantity}`
+            );
+          }
+        });
+
+        req.log.info("Successfully processed order", {
+          orderIndex: index,
+          orderId,
+          variety,
         });
 
         return {
@@ -1009,26 +1200,88 @@ const createOutgoingOrder = async (req, reply) => {
               bagSizes: matchingDetail.bagSizes,
             },
           ],
-          // Add a mapped version for use in outgoingOrderDetails
+          // 🔧 FIXED: Properly structure the quantity object according to schema
           mappedIncomingBagSizes: fetchedOrder.incomingBagSizes.map(bag => ({
             size: bag.size,
-            initialQuantity: bag.quantity,
-            currentQuantity: bag.quantity,
+            quantity: {
+              initialQuantity: bag.quantity.initialQuantity, // Access nested properties
+              currentQuantity: bag.quantity.currentQuantity, // Access nested properties
+            },
             location: bag.location,
           })),
         };
       })
     );
 
+    req.log.info("Successfully validated all orders and quantities", {
+      processedOrdersCount: incomingOrders.length,
+    });
+
     const incomingOrderMap = Object.fromEntries(
       incomingOrders.map((o) => [o._id.toString(), o])
     );
 
+    // Calculate total current stock from all incoming orders BEFORE any reductions
+    const totalIncomingStock = await KapoorIncomingOrder.aggregate([
+      {
+        $match: {
+          coldStorageId: new mongoose.Types.ObjectId(req.storeAdmin._id),
+        },
+      },
+      { $unwind: "$incomingBagSizes" },
+      {
+        $group: {
+          _id: null,
+          totalCurrentQuantity: { $sum: "$incomingBagSizes.quantity.currentQuantity" }, // 🔧 FIXED: Access nested currentQuantity
+        },
+      },
+    ]);
+
+    console.log("Total incoming stock aggregation result:", totalIncomingStock);
+    console.log("Total incoming stock value:", totalIncomingStock.length > 0 ? totalIncomingStock[0].totalCurrentQuantity : 0);
+
+    // Calculate current outgoing order total
+    const currentOutgoingTotal = orders.reduce((total, order) => {
+      console.log("Processing order for total calculation:", order);
+      const orderTotal = order.bagUpdates.reduce((bagTotal, update) => {
+        console.log("Processing bag update:", update);
+        console.log("Current bag total:", bagTotal);
+        console.log("Adding quantity:", update.quantityToRemove);
+        return bagTotal + update.quantityToRemove;
+      }, 0);
+      console.log("Order total:", orderTotal);
+      return total + orderTotal;
+    }, 0);
+
+    console.log("Current outgoing order total:", currentOutgoingTotal);
+
+    // Calculate currentStockAtThatTime (modified formula)
+    const incomingTotal = totalIncomingStock.length > 0 ? totalIncomingStock[0].totalCurrentQuantity : 0;
+    const currentStockAtThatTime = incomingTotal - currentOutgoingTotal;
+
+    console.log("Final calculation breakdown (Modified):");
+    console.log("- Total Incoming Stock:", incomingTotal);
+    console.log("- Current Order's Outgoing Total:", currentOutgoingTotal);
+    console.log("= Current Stock At That Time:", currentStockAtThatTime);
+
+    req.log.info("Stock calculation completed", {
+      incomingTotal,
+      currentOutgoingTotal,
+      currentStockAtThatTime,
+    });
+
+    // Initialize bulk operations array
     const bulkOps = [];
+    
     const outgoingOrderDetails = orders.map(({ orderId, variety, bagUpdates }) => {
+      console.log("Processing variety:", variety);
+
       const bagSizes = bagUpdates
-        .filter((u) => u.quantityToRemove > 0)
+        .filter((u) => u.quantityToRemove > 0) // Filter out zero quantities
         .map(({ size, location, quantityToRemove }) => {
+          console.log("Processing bag update:", { size, location, quantityToRemove, variety });
+
+          // 🔧 FIXED: Update the nested currentQuantity field in the incoming order
           bulkOps.push({
             updateOne: {
               filter: {
@@ -1039,12 +1292,9 @@ const createOutgoingOrder = async (req, reply) => {
               },
               update: {
                 $inc: {
-                  "incomingBagSizes.$[j].quantity": -quantityToRemove,
+                  "incomingBagSizes.$.quantity.currentQuantity": -quantityToRemove, // 🔧 FIXED: Target nested currentQuantity
                 },
               },
-              arrayFilters: [
-                { "j.size": size, "j.location": location },
-              ],
             },
           });
 
@@ -1067,9 +1317,13 @@ const createOutgoingOrder = async (req, reply) => {
       };
     });
 
-    // Bulk update incoming orders to decrement stock
+    // Execute bulk write for inventory updates
     if (bulkOps.length > 0) {
-      await KapoorIncomingOrder.bulkWrite(bulkOps, { session });
+      const result = await KapoorIncomingOrder.bulkWrite(bulkOps, { session });
+      req.log.info("Bulk operations completed", {
+        modifiedCount: result.modifiedCount,
+        matchedCount: result.matchedCount,
+      });
     }
 
     // Get delivery voucher number (assuming helper exists)
@@ -1077,34 +1331,7 @@ const createOutgoingOrder = async (req, reply) => {
       req.storeAdmin._id
     );
 
-    // Calculate total current stock from all incoming orders
-    const totalIncomingStock = await KapoorIncomingOrder.aggregate([
-      {
-        $match: {
-          coldStorageId: new mongoose.Types.ObjectId(req.storeAdmin._id),
-        },
-      },
-      { $unwind: "$incomingBagSizes" },
-      {
-        $group: {
-          _id: null,
-          totalCurrentQuantity: { $sum: "$incomingBagSizes.quantity" },
-        },
-      },
-    ]);
-    const incomingTotal = totalIncomingStock.length > 0 ? totalIncomingStock[0].totalCurrentQuantity : 0;
-
-    // Calculate current outgoing order total
-    const currentOutgoingTotal = orders.reduce((total, order) => {
-      const orderTotal = order.bagUpdates.reduce((bagTotal, update) => {
-        return bagTotal + update.quantityToRemove;
-      }, 0);
-      return total + orderTotal;
-    }, 0);
-
-    // Calculate currentStockAtThatTime
-    const currentStockAtThatTime = incomingTotal - currentOutgoingTotal;
-
+    // Create the outgoing order document
     const outgoingOrder = new KapoorOutgoingOrder({
       coldStorageId: req.storeAdmin._id,
       farmerAccount: id,
@@ -1120,8 +1347,14 @@ const createOutgoingOrder = async (req, reply) => {
     });
 
     await outgoingOrder.save({ session });
+    req.log.info("Outgoing order saved", {
+      outgoingOrderId: outgoingOrder._id,
+    });
+
     await session.commitTransaction();
     session.endSession();
+
+    req.log.info("Transaction committed successfully");
 
     return reply.code(200).send({
       status: "Success",
@@ -1129,6 +1362,10 @@ const createOutgoingOrder = async (req, reply) => {
       outgoingOrder,
     });
   } catch (err) {
+    req.log.error("Error processing outgoing order", {
+      errorMessage: err.message,
+    });
+
     await session.abortTransaction();
     session.endSession();
 
