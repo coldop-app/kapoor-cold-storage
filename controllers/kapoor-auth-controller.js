@@ -5,7 +5,6 @@ import {
   quickRegisterSchema,
   farmerIdSchema,
 } from "../utils/validationSchemas.js";
-import { formatFarmerName, formatName, getReceiptNumberHelper, getKapoorReceiptNumberHelper } from "../utils/helpers.js";
 import bcrypt from "bcryptjs";
 import FarmerProfile from "../models/farmerProfile.js";
 import FarmerAccount from "../models/farmerAccount.js";
@@ -963,4 +962,4 @@ const getAllIncomingOrdersOfASingleFarmer = async (req, reply) => {
 
 
 
-export { quickRegisterFarmer, getFarmersIdsForCheck, getAllFarmerProfiles, getAccountsForFarmerProfile, searchFarmerProfiles, createIncomingOrder, getReceiptVoucherNumbers, getKapoorDaybookOrders, getAllIncomingOrdersOfASingleFarmer, createKapoorOutgoingOrder };
+export { quickRegisterFarmer, getFarmersIdsForCheck, getAllFarmerProfiles, getAccountsForFarmerProfile, searchFarmerProfiles, createIncomingOrder, getReceiptVoucherNumbers, getKapoorDaybookOrders, getAllIncomingOrdersOfASingleFarmer,};
