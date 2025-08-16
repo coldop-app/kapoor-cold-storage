@@ -14,6 +14,7 @@ import {
   getKapoorTopFarmers,
   searchKapoorOrdersByVariety,
   createOutgoingOrder,
+  getFarmerStockSummary,
 } from "../controllers/kapoor-auth-controller.js";
 import { storeAdminProtect } from "../middleware/authMiddleware.js";
 
@@ -106,6 +107,13 @@ function kapoorRoutes(fastify, options, done) {
     "/search-orders",
     { preHandler: [storeAdminProtect] },
     searchKapoorOrdersByVariety
+  );
+
+  // Get farmer stock summary
+  fastify.post(
+    "/farmer-stock-summary",
+    { preHandler: [storeAdminProtect] },
+    getFarmerStockSummary
   );
 
   done();

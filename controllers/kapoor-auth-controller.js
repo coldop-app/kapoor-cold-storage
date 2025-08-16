@@ -2212,6 +2212,287 @@ const createOutgoingOrder = async (req, reply) => {
   }
 };
 
+const getFarmerStockSummary = async (req, reply) => {
+  try {
+    const coldStorageId = req.storeAdmin._id;
+    const { farmerAccountIds } = req.body;
+
+    req.log.info("Starting farmer stock summary calculation", {
+      farmerAccountIds,
+      coldStorageId,
+      requestId: req.id,
+    });
+
+    if (!farmerAccountIds || !Array.isArray(farmerAccountIds) || farmerAccountIds.length === 0) {
+      req.log.warn("Missing or invalid farmer account IDs in request body", {
+        farmerAccountIds,
+        coldStorageId,
+        requestId: req.id,
+      });
+      return reply.code(400).send({
+        status: "Fail",
+        message: "farmerAccountIds array is required and must not be empty",
+      });
+    }
+
+    if (!coldStorageId) {
+      req.log.warn("Missing cold storage ID for farmer stock summary", {
+        coldStorageId,
+        requestId: req.id,
+      });
+      return reply.code(400).send({
+        status: "Fail",
+        message: "coldStorageId is required",
+      });
+    }
+
+    // Validate MongoDB ObjectIds
+    const invalidIds = farmerAccountIds.filter(id => !mongoose.Types.ObjectId.isValid(id));
+    if (invalidIds.length > 0) {
+      req.log.warn("Invalid ObjectId format in farmer account IDs", {
+        invalidIds,
+        coldStorageId,
+        requestId: req.id,
+      });
+      return reply.code(400).send({
+        status: "Fail",
+        message: "Invalid ID format",
+        errorMessage: "Please provide valid MongoDB ObjectIds",
+        invalidIds,
+      });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(coldStorageId)) {
+      req.log.warn("Invalid cold storage ID format", {
+        coldStorageId,
+        requestId: req.id,
+      });
+      return reply.code(400).send({
+        status: "Fail",
+        message: "Invalid cold storage ID format",
+        errorMessage: "Please provide valid MongoDB ObjectId",
+      });
+    }
+
+    // Validate that all farmer accounts belong to the same farmer profile
+    req.log.info("Validating farmer accounts belong to same profile", {
+      farmerAccountIds,
+      requestId: req.id,
+    });
+
+    const farmerAccounts = await FarmerAccount.find({
+      _id: { $in: farmerAccountIds },
+      storeAdmin: coldStorageId,
+    }).populate('profile', 'name fatherName');
+
+    if (farmerAccounts.length !== farmerAccountIds.length) {
+      req.log.warn("Some farmer accounts not found", {
+        requestedIds: farmerAccountIds,
+        foundAccounts: farmerAccounts.length,
+        requestId: req.id,
+      });
+      return reply.code(400).send({
+        status: "Fail",
+        message: "Some farmer accounts not found",
+        errorMessage: "One or more farmer account IDs do not exist in this cold storage",
+      });
+    }
+
+    // Check if all accounts belong to the same farmer profile
+    const uniqueProfiles = [...new Set(farmerAccounts.map(account => account.profile._id.toString()))];
+    if (uniqueProfiles.length > 1) {
+      req.log.warn("Farmer accounts belong to different profiles", {
+        farmerAccountIds,
+        uniqueProfiles,
+        requestId: req.id,
+      });
+      return reply.code(400).send({
+        status: "Fail",
+        message: "Farmer accounts must belong to the same farmer profile",
+        errorMessage: "All farmer accounts must be associated with the same farmer profile",
+        uniqueProfiles: uniqueProfiles.length,
+        farmerAccounts: farmerAccounts.map(acc => ({
+          accountId: acc._id,
+          profileName: acc.profile.name,
+          profileFatherName: acc.profile.fatherName,
+        })),
+      });
+    }
+
+    req.log.info("Farmer accounts validation passed", {
+      farmerAccountIds,
+      profileId: uniqueProfiles[0],
+      requestId: req.id,
+    });
+
+    req.log.info("Starting farmer incoming orders aggregation", {
+      farmerAccountIds,
+      coldStorageId,
+      requestId: req.id,
+    });
+
+    // Aggregate incoming orders for all farmer accounts
+    const incomingOrders = await KapoorIncomingOrder.aggregate([
+      {
+        $match: {
+          farmerAccount: { $in: farmerAccountIds.map(id => new mongoose.Types.ObjectId(id)) },
+          coldStorageId: new mongoose.Types.ObjectId(coldStorageId),
+        },
+      },
+      { $unwind: "$incomingBagSizes" },
+      {
+        $group: {
+          _id: {
+            farmerAccount: "$farmerAccount",
+            variety: "$variety",
+            size: "$incomingBagSizes.size",
+          },
+          initialQuantity: {
+            $sum: "$incomingBagSizes.quantity.initialQuantity",
+          },
+          currentQuantity: {
+            $sum: "$incomingBagSizes.quantity.currentQuantity",
+          },
+        },
+      },
+    ]);
+
+    req.log.info("Completed farmer incoming orders aggregation", {
+      farmerAccountIds,
+      incomingOrdersCount: incomingOrders.length,
+      requestId: req.id,
+    });
+
+    req.log.info("Starting farmer outgoing orders aggregation", {
+      farmerAccountIds,
+      coldStorageId,
+      requestId: req.id,
+    });
+
+    // Aggregate outgoing orders for all farmer accounts
+    const outgoingOrders = await KapoorOutgoingOrder.aggregate([
+      {
+        $match: {
+          farmerAccount: { $in: farmerAccountIds.map(id => new mongoose.Types.ObjectId(id)) },
+          coldStorageId: new mongoose.Types.ObjectId(coldStorageId),
+        },
+      },
+      { $unwind: "$orderDetails" },
+      { $unwind: "$orderDetails.bagSizes" },
+      {
+        $group: {
+          _id: {
+            farmerAccount: "$farmerAccount",
+            variety: "$orderDetails.variety",
+            size: "$orderDetails.bagSizes.size",
+          },
+          quantityRemoved: {
+            $sum: "$orderDetails.bagSizes.quantityRemoved",
+          },
+        },
+      },
+    ]);
+
+    req.log.info("Completed farmer outgoing orders aggregation", {
+      farmerAccountIds,
+      outgoingOrdersCount: outgoingOrders.length,
+      requestId: req.id,
+    });
+
+    req.log.info("Processing farmer summary calculations", {
+      farmerAccountIds,
+      requestId: req.id,
+    });
+
+    // Group incoming orders by farmer account
+    const incomingByFarmer = incomingOrders.reduce((acc, order) => {
+      const { farmerAccount, variety, size } = order._id;
+      if (!acc[farmerAccount]) acc[farmerAccount] = {};
+      if (!acc[farmerAccount][variety]) acc[farmerAccount][variety] = {};
+      acc[farmerAccount][variety][size] = {
+        initialQuantity: order.initialQuantity,
+        currentQuantity: order.currentQuantity,
+      };
+      return acc;
+    }, {});
+
+    // Group outgoing orders by farmer account
+    const outgoingByFarmer = outgoingOrders.reduce((acc, order) => {
+      const { farmerAccount, variety, size } = order._id;
+      if (!acc[farmerAccount]) acc[farmerAccount] = {};
+      if (!acc[farmerAccount][variety]) acc[farmerAccount][variety] = {};
+      if (!acc[farmerAccount][variety][size]) {
+        acc[farmerAccount][variety][size] = { quantityRemoved: 0 };
+      }
+      acc[farmerAccount][variety][size].quantityRemoved = order.quantityRemoved;
+      return acc;
+    }, {});
+
+    // Combine incoming and outgoing data for each farmer
+    const allFarmersSummary = {};
+
+    // Process all farmer account IDs (including those with no orders)
+    for (const farmerAccountId of farmerAccountIds) {
+      const incomingSummary = incomingByFarmer[farmerAccountId] || {};
+      const outgoingSummary = outgoingByFarmer[farmerAccountId] || {};
+
+      // Merge incoming and outgoing data
+      const combinedSummary = { ...incomingSummary };
+
+      // Add outgoing quantities to the combined summary
+      Object.keys(outgoingSummary).forEach(variety => {
+        if (!combinedSummary[variety]) combinedSummary[variety] = {};
+        Object.keys(outgoingSummary[variety]).forEach(size => {
+          if (!combinedSummary[variety][size]) {
+            combinedSummary[variety][size] = {
+              initialQuantity: 0,
+              currentQuantity: 0,
+            };
+          }
+          combinedSummary[variety][size].quantityRemoved = outgoingSummary[variety][size].quantityRemoved;
+        });
+      });
+
+      // Convert the stock summary object into an array
+      const stockSummaryArray = Object.entries(combinedSummary).map(
+        ([variety, sizes]) => ({
+          variety,
+          sizes: Object.entries(sizes).map(([size, quantities]) => ({
+            size,
+            ...quantities,
+          })),
+        })
+      );
+
+      allFarmersSummary[farmerAccountId] = stockSummaryArray;
+    }
+
+    req.log.info("Successfully generated farmer stock summaries", {
+      farmerAccountIds,
+      farmersProcessed: Object.keys(allFarmersSummary).length,
+      requestId: req.id,
+    });
+
+    reply.code(200).send({
+      status: "Success",
+      stockSummaries: allFarmersSummary,
+    });
+  } catch (err) {
+    req.log.error("Error in farmer stock summary calculation", {
+      error: err.message,
+      stack: err.stack,
+      farmerAccountIds: req.body.farmerAccountIds,
+      coldStorageId: req.storeAdmin._id,
+      requestId: req.id,
+    });
+    reply.code(500).send({
+      status: "Fail",
+      message: "Error occurred while calculating stock summaries",
+      errorMessage: err.message,
+    });
+  }
+};
+
 export {
   quickRegisterFarmer,
   getKapoorColdStorageSummary,
@@ -2227,4 +2508,5 @@ export {
   getAllOrdersOfASingleFarmer,
   searchKapoorOrdersByVariety,
   createOutgoingOrder,
+  getFarmerStockSummary,
 };
