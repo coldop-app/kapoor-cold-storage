@@ -74,6 +74,11 @@ const kapoorIncomingOrderSchema = new mongoose.Schema(
       required: true,
     },
 
+    farmerCurrentStockAtThatTime: {
+      type: Number,
+      required: true,
+    },
+
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "StoreAdmin",

@@ -474,6 +474,57 @@ const createIncomingOrder = async (req, reply) => {
 
     const currentStockAtThatTime = existingStock + additionalStock;
 
+    // Calculate farmer-specific current stock at that time
+    let farmerCurrentStockAtThatTime = 0;
+    try {
+      // Get the farmer profile ID from the farmer account
+      const farmerProfileId = farmerAccountDoc.profile;
+
+      // Find all previous incoming orders for this specific farmer profile
+      // First get all farmer accounts for this profile
+      const farmerAccounts = await FarmerAccount.find({
+        profile: farmerProfileId,
+        storeAdmin: storeAdminId
+      }).distinct('_id');
+
+      // Then find all previous incoming orders for these accounts
+      const previousFarmerOrders = await KapoorIncomingOrder.find({
+        coldStorageId: storeAdminId,
+        farmerAccount: { $in: farmerAccounts }
+      });
+
+      // Calculate total current stock from all previous orders for this farmer
+      const previousFarmerStock = previousFarmerOrders.reduce((total, order) => {
+        const orderCurrentStock = order.incomingBagSizes.reduce((sum, bag) =>
+          sum + (bag.quantity.currentQuantity || 0), 0
+        );
+        return total + orderCurrentStock;
+      }, 0);
+
+      // Add the current order's stock to get the running total
+      farmerCurrentStockAtThatTime = previousFarmerStock + additionalStock;
+
+      req.log.info("Farmer current stock calculation", {
+        farmerProfileId,
+        previousFarmerStock,
+        additionalStock,
+        farmerCurrentStockAtThatTime,
+        storeAdminId,
+        requestId: req.id,
+      });
+    } catch (error) {
+      req.log.error("Error calculating farmer current stock", {
+        error: error.message,
+        storeAdminId,
+        requestId: req.id,
+      });
+      return reply.code(500).send({
+        status: "Fail",
+        message: "Error calculating farmer current stock",
+        errorMessage: error.message,
+      });
+    }
+
     req.log.info("Final current stock calculation", {
       existingStock,
       additionalStock,
@@ -495,6 +546,7 @@ const createIncomingOrder = async (req, reply) => {
       remarks: remarks || "",
       createdBy: storeAdminId,
       currentStockAtThatTime,
+      farmerCurrentStockAtThatTime,
     });
 
     req.log.info("Incoming order created successfully", {
@@ -503,6 +555,7 @@ const createIncomingOrder = async (req, reply) => {
       farmerAccount,
       voucherNumber: receiptNumber,
       currentStockAtThatTime,
+      farmerCurrentStockAtThatTime,
     });
 
     return reply.code(201).send({
@@ -518,6 +571,7 @@ const createIncomingOrder = async (req, reply) => {
         dateOfEntry: newIncomingOrder.dateOfEntry,
         remarks: newIncomingOrder.remarks,
         currentStockAtThatTime: newIncomingOrder.currentStockAtThatTime,
+        farmerCurrentStockAtThatTime: newIncomingOrder.farmerCurrentStockAtThatTime,
         createdAt: newIncomingOrder.createdAt,
       },
     });
@@ -529,6 +583,247 @@ const createIncomingOrder = async (req, reply) => {
     return reply.code(500).send({
       status: "Fail",
       message: "Some error occurred while creating incoming order",
+      errorMessage: err.message,
+    });
+  }
+};
+
+const editKapoorIncomingOrder = async (req, reply) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    const orderId = req.params.id;
+    const updates = req.body;
+    const storeAdminId = req.storeAdmin._id;
+
+    // Validate orderId
+    if (!mongoose.Types.ObjectId.isValid(orderId)) {
+      req.log.warn("Invalid orderId provided", { orderId });
+      return reply.code(400).send({
+        status: "Fail",
+        message: "Invalid order ID format",
+      });
+    }
+
+    // Find the existing order
+    const existingOrder = await KapoorIncomingOrder.findById(orderId).session(session);
+    if (!existingOrder) {
+      req.log.warn("Order not found", { orderId });
+      return reply.code(404).send({
+        status: "Fail",
+        message: "Order not found",
+      });
+    }
+
+    // Verify the order belongs to this store admin
+    if (!existingOrder.coldStorageId.equals(storeAdminId)) {
+      req.log.warn("Order does not belong to this store admin", {
+        orderId,
+        orderStoreId: existingOrder.coldStorageId,
+        requestStoreId: storeAdminId
+      });
+      return reply.code(403).send({
+        status: "Fail",
+        message: "You can only edit orders from your own store",
+      });
+    }
+
+    req.log.info("Processing incoming order update", {
+      orderId,
+      updates,
+      requestId: req.id,
+    });
+
+    // Step 1: Handle direct field updates
+    const allowedDirectUpdates = ["remarks", "dateOfEntry"];
+    allowedDirectUpdates.forEach((field) => {
+      if (updates[field] !== undefined) {
+        existingOrder[field] = updates[field];
+      }
+    });
+
+    // Step 2: Handle incomingBagSizes updates
+    if (updates.incomingBagSizes && Array.isArray(updates.incomingBagSizes) && updates.incomingBagSizes.length > 0) {
+      // Validate incomingBagSizes structure
+      for (const bagSize of updates.incomingBagSizes) {
+        if (
+          !bagSize.size ||
+          !bagSize.quantity ||
+          typeof bagSize.quantity !== "object" ||
+          bagSize.quantity.initialQuantity == null ||
+          bagSize.quantity.currentQuantity == null ||
+          typeof bagSize.quantity.initialQuantity !== "number" ||
+          typeof bagSize.quantity.currentQuantity !== "number" ||
+          bagSize.quantity.initialQuantity < 0 ||
+          bagSize.quantity.currentQuantity < 0 ||
+          !bagSize.location
+        ) {
+          throw new Error(
+            "Each bag size must have size, quantity (with initial and current), and location"
+          );
+        }
+      }
+
+      // Filter out zero-quantity bagSizes
+      const filteredBagSizes = updates.incomingBagSizes.filter(bag =>
+        bag.quantity.initialQuantity > 0 || bag.quantity.currentQuantity > 0
+      );
+
+      if (filteredBagSizes.length === 0) {
+        throw new Error("At least one bag size must have non-zero quantities");
+      }
+
+      existingOrder.incomingBagSizes = filteredBagSizes;
+    }
+
+    // Step 3: Handle variety update
+    if (updates.variety !== undefined) {
+      existingOrder.variety = updates.variety;
+    }
+
+    // Step 4: Handle farmerAccount update (with validation)
+    if (updates.farmerAccount !== undefined) {
+      if (!mongoose.Types.ObjectId.isValid(updates.farmerAccount)) {
+        throw new Error("Invalid farmer account ID format");
+      }
+
+      const farmerAccountDoc = await FarmerAccount.findOne({
+        _id: updates.farmerAccount,
+        storeAdmin: storeAdminId,
+      }).session(session);
+
+      if (!farmerAccountDoc) {
+        throw new Error("Farmer account not found or does not belong to this store");
+      }
+
+      existingOrder.farmerAccount = updates.farmerAccount;
+    }
+
+    // Step 5: Recalculate stock values for all orders
+    // Get all incoming orders for this cold storage, sorted by creation time
+    const allIncomingOrders = await KapoorIncomingOrder.find({
+      coldStorageId: storeAdminId,
+    })
+    .sort({ createdAt: 1 })
+    .session(session);
+
+    // Calculate cumulative stock for all orders
+    let cumulativeStock = 0;
+    for (const order of allIncomingOrders) {
+      if (order._id.equals(existingOrder._id)) {
+        // For the current order being edited, use the updated quantities
+        const orderCurrentStock = existingOrder.incomingBagSizes.reduce((sum, bag) =>
+          sum + (bag.quantity.currentQuantity || 0), 0
+        );
+        cumulativeStock += orderCurrentStock;
+        existingOrder.currentStockAtThatTime = cumulativeStock;
+      } else {
+        // For other orders, use their existing quantities
+        const orderCurrentStock = order.incomingBagSizes.reduce((sum, bag) =>
+          sum + (bag.quantity.currentQuantity || 0), 0
+        );
+        cumulativeStock += orderCurrentStock;
+
+        // Update the currentStockAtThatTime for this order
+        await KapoorIncomingOrder.updateOne(
+          { _id: order._id },
+          { $set: { currentStockAtThatTime: cumulativeStock } }
+        ).session(session);
+      }
+    }
+
+    // Step 6: Recalculate farmer-specific stock for the current order
+    if (updates.farmerAccount || updates.incomingBagSizes) {
+      let farmerCurrentStockAtThatTime = 0;
+
+      try {
+        // Get the farmer profile ID from the farmer account
+        const farmerAccountDoc = await FarmerAccount.findById(existingOrder.farmerAccount).session(session);
+        const farmerProfileId = farmerAccountDoc.profile;
+
+        // Find all previous incoming orders for this specific farmer profile
+        const farmerAccounts = await FarmerAccount.find({
+          profile: farmerProfileId,
+          storeAdmin: storeAdminId
+        }).distinct('_id').session(session);
+
+        // Find all previous incoming orders for these accounts (excluding current order)
+        const previousFarmerOrders = await KapoorIncomingOrder.find({
+          coldStorageId: storeAdminId,
+          farmerAccount: { $in: farmerAccounts },
+          createdAt: { $lt: existingOrder.createdAt }
+        }).session(session);
+
+        // Calculate total current stock from all previous orders for this farmer
+        const previousFarmerStock = previousFarmerOrders.reduce((total, order) => {
+          const orderCurrentStock = order.incomingBagSizes.reduce((sum, bag) =>
+            sum + (bag.quantity.currentQuantity || 0), 0
+          );
+          return total + orderCurrentStock;
+        }, 0);
+
+        // Add the current order's stock to get the running total
+        const currentOrderStock = existingOrder.incomingBagSizes.reduce((sum, bag) =>
+          sum + (bag.quantity.currentQuantity || 0), 0
+        );
+        farmerCurrentStockAtThatTime = previousFarmerStock + currentOrderStock;
+
+        existingOrder.farmerCurrentStockAtThatTime = farmerCurrentStockAtThatTime;
+
+        req.log.info("Farmer current stock calculation updated", {
+          farmerProfileId,
+          previousFarmerStock,
+          currentOrderStock,
+          farmerCurrentStockAtThatTime,
+          storeAdminId,
+          requestId: req.id,
+        });
+      } catch (error) {
+        req.log.error("Error calculating farmer current stock", {
+          error: error.message,
+          storeAdminId,
+          requestId: req.id,
+        });
+        throw new Error("Error calculating farmer current stock");
+      }
+    }
+
+    // Save the updated order
+    const updatedOrder = await existingOrder.save({ session });
+
+    await session.commitTransaction();
+    session.endSession();
+
+    req.log.info("Incoming order updated successfully", {
+      orderId: updatedOrder._id,
+      storeAdminId,
+      farmerAccount: updatedOrder.farmerAccount,
+      variety: updatedOrder.variety,
+      currentStockAtThatTime: updatedOrder.currentStockAtThatTime,
+      farmerCurrentStockAtThatTime: updatedOrder.farmerCurrentStockAtThatTime,
+      requestId: req.id,
+    });
+
+    reply.code(200).send({
+      status: "Success",
+      message: "Incoming order updated successfully",
+      data: updatedOrder,
+    });
+  } catch (err) {
+    req.log.error("Error updating incoming order", {
+      error: err.message,
+      stack: err.stack,
+      orderId: req.params?.id,
+      requestId: req.id,
+    });
+
+    await session.abortTransaction();
+    session.endSession();
+
+    reply.code(400).send({
+      status: "Fail",
+      message: "Failed to update incoming order",
       errorMessage: err.message,
     });
   }
@@ -989,7 +1284,7 @@ const getAllIncomingOrdersOfASingleFarmer = async (req, reply) => {
         select: "farmerId variety profile",
       })
       .select(
-        "_id coldStorageId remarks farmerAccount variety voucher incomingBagSizes dateOfEntry currentStockAtThatTime createdAt"
+        "_id coldStorageId remarks farmerAccount variety voucher incomingBagSizes dateOfEntry currentStockAtThatTime farmerCurrentStockAtThatTime createdAt"
       )
       .sort({ createdAt: -1 });
 
@@ -1035,7 +1330,7 @@ const getAllOrdersOfASingleFarmer = async (req, reply) => {
         select: "farmerId variety profile",
       })
       .select(
-        "_id coldStorageId remarks farmerAccount variety voucher incomingBagSizes dateOfEntry currentStockAtThatTime createdAt"
+        "_id coldStorageId remarks farmerAccount variety voucher incomingBagSizes dateOfEntry currentStockAtThatTime farmerCurrentStockAtThatTime createdAt"
       )
       .sort({ createdAt: -1 });
 
@@ -1081,6 +1376,7 @@ const getAllOrdersOfASingleFarmer = async (req, reply) => {
           dateOfEntry: o.dateOfEntry,
           remarks: o.remarks,
           currentStockAtThatTime: o.currentStockAtThatTime,
+          farmerCurrentStockAtThatTime: o.farmerCurrentStockAtThatTime,
           incomingBagSizes: sortBagSizes(
             (o.incomingBagSizes || []).map((b) => ({
               size: b.size,
@@ -2501,6 +2797,7 @@ export {
   getAccountsForFarmerProfile,
   searchFarmerProfiles,
   createIncomingOrder,
+  editKapoorIncomingOrder,
   getReceiptVoucherNumbers,
   getKapoorDaybookOrders,
   getKapoorTopFarmers,

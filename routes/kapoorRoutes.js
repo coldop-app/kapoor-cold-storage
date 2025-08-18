@@ -7,6 +7,7 @@ import {
   getAccountsForFarmerProfile,
   searchFarmerProfiles,
   createIncomingOrder,
+  editKapoorIncomingOrder,
   getReceiptVoucherNumbers,
   getAllIncomingOrdersOfASingleFarmer,
   getKapoorColdStorageSummary,
@@ -55,6 +56,13 @@ function kapoorRoutes(fastify, options, done) {
     "/incoming-orders",
     { preHandler: [storeAdminProtect] },
     createIncomingOrder
+  );
+
+  // Edit incoming order route
+  fastify.put(
+    "/incoming-orders/:id",
+    { preHandler: [storeAdminProtect] },
+    editKapoorIncomingOrder
   );
 
   // Get receipt voucher numbers for this cold storage
