@@ -16,6 +16,7 @@ import {
   searchKapoorOrdersByVariety,
   createOutgoingOrder,
   getFarmerStockSummary,
+  searchOrderByReceiptNumber,
 } from "../controllers/kapoor-auth-controller.js";
 import { storeAdminProtect } from "../middleware/authMiddleware.js";
 
@@ -122,6 +123,13 @@ function kapoorRoutes(fastify, options, done) {
     "/farmer-stock-summary",
     { preHandler: [storeAdminProtect] },
     getFarmerStockSummary
+  );
+
+  // Search orders by receipt number
+  fastify.post(
+    "/search-by-receipt",
+    { preHandler: [storeAdminProtect] },
+    searchOrderByReceiptNumber
   );
 
   done();

@@ -2789,6 +2789,135 @@ const getFarmerStockSummary = async (req, reply) => {
   }
 };
 
+const searchOrderByReceiptNumber = async (req, reply) => {
+  try {
+    const coldStorageId = req.storeAdmin._id;
+    const { receiptNumber } = req.body;
+
+    if (!receiptNumber) {
+      req.log.warn("Receipt number not provided", { coldStorageId });
+      return reply.code(400).send({
+        status: "Fail",
+        message: "Receipt number is required"
+      });
+    }
+
+    req.log.info("Searching for order with receipt number", {
+      receiptNumber,
+      coldStorageId
+    });
+
+    // Search in both KapoorIncomingOrder and KapoorOutgoingOrder collections
+    const [incomingOrders, outgoingOrders] = await Promise.all([
+      KapoorIncomingOrder.find({
+        coldStorageId,
+        'voucher.voucherNumber': receiptNumber
+      }).populate({
+        path: 'farmerAccount',
+        model: FarmerAccount,
+        populate: {
+          path: 'profile',
+          model: 'FarmerProfile',
+          select: 'name mobileNumber address'
+        },
+        select: 'farmerId variety profile'
+      }),
+      KapoorOutgoingOrder.find({
+        coldStorageId,
+        'voucher.voucherNumber': receiptNumber
+      }).populate({
+        path: 'farmerAccount',
+        model: FarmerAccount,
+        populate: {
+          path: 'profile',
+          model: 'FarmerProfile',
+          select: 'name mobileNumber address'
+        },
+        select: 'farmerId variety profile'
+      })
+    ]);
+
+    // If no orders found
+    if (!incomingOrders.length && !outgoingOrders.length) {
+      req.log.info("No orders found with receipt number", {
+        receiptNumber,
+        coldStorageId
+      });
+      return reply.code(404).send({
+        status: "Fail",
+        message: "No orders found with this receipt number"
+      });
+    }
+
+    // Convert to plain objects and sort bag sizes for both types
+    const processOrders = (orders) => {
+      return orders.map(order => {
+        const orderObject = order.toObject();
+
+        // Transform farmerAccount to match the expected format
+        const fa = orderObject.farmerAccount;
+        const profile = fa?.profile || {};
+        const baseAccount = {
+          _id: fa._id,
+          name: profile.name || "",
+          address: profile.address || "",
+          mobileNumber: profile.mobileNumber || "",
+          farmerId: fa.farmerId,
+        };
+
+        // Replace the farmerAccount with the transformed baseAccount
+        orderObject.farmerAccount = baseAccount;
+
+        if (orderObject.orderDetails) {
+          orderObject.orderDetails = orderObject.orderDetails.map(detail => ({
+            ...detail,
+            bagSizes: detail.bagSizes.sort((a, b) =>
+              a.size.localeCompare(b.size)
+            )
+          }));
+        }
+        if (orderObject.incomingBagSizes) {
+          orderObject.incomingBagSizes = orderObject.incomingBagSizes.sort((a, b) =>
+            a.size.localeCompare(b.size)
+          );
+        }
+        return orderObject;
+      });
+    };
+
+    const processedIncomingOrders = processOrders(incomingOrders);
+    const processedOutgoingOrders = processOrders(outgoingOrders);
+
+    req.log.info("Successfully found orders", {
+      receiptNumber,
+      incomingCount: incomingOrders.length,
+      outgoingCount: outgoingOrders.length
+    });
+
+    reply.code(200).send({
+      status: "Success",
+      data: {
+        incoming: processedIncomingOrders,
+        outgoing: processedOutgoingOrders
+      }
+    });
+
+  } catch (err) {
+    req.log.error("Error searching for orders", {
+      error: err.message,
+      stack: err.stack,
+      receiptNumber: req.body?.receiptNumber,
+      coldStorageId: req.storeAdmin._id
+    });
+
+    reply.code(500).send({
+      status: "Fail",
+      message: "Error occurred while searching for orders",
+      errorMessage: err.message
+    });
+  }
+};
+
 export {
   quickRegisterFarmer,
   getKapoorColdStorageSummary,
@@ -2806,4 +2935,5 @@ export {
   searchKapoorOrdersByVariety,
   createOutgoingOrder,
   getFarmerStockSummary,
+  searchOrderByReceiptNumber,
 };
